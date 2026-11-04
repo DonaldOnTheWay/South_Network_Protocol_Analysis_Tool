@@ -908,30 +908,35 @@ def parse_lme_dlt645(di_code: str, ctrl: int, data: bytes
     return None, ""
 
 
+# 摘要优先级：条目全名 → 简短显示名（顺序即「详细版本」列的前排顺序）
+_SUMMARY_PRIORITY = {
+    "外部厂商代码": "厂商",
+    "外部芯片代码": "芯片",
+    "外部版本号": "版本",
+    "外部版本日期": "日期",
+    "总工程版本": "工程版本",
+    "编译时间": "编译",
+    "网络层版本": "NWK",
+    "APS层版本": "APS",
+    "APP层版本": "APP",
+    "PHY层版本": "PHY",
+    "载波MAC层版本": "MAC",
+    "芯片程序版本": "DSP",
+    "硬件型号": "硬件",
+    "芯片型号": "芯片型号",
+}
+
+
 def format_lme_info_summary(results: List[Tuple[str, str]], max_len: int = 120) -> str:
     """将解析结果格式化为适合表格显示的摘要字符串
 
-    优先显示关键信息：厂商代码、芯片代码、版本、编译时间
+    优先显示关键信息：厂商代码、芯片代码、版本、编译时间、总工程版本
     """
     if not results:
         return "无数据"
 
     # 定义优先级和简短显示名称
-    priority_keys = {
-        "外部厂商代码": "厂商",
-        "外部芯片代码": "芯片",
-        "外部版本号": "版本",
-        "外部版本日期": "日期",
-        "编译时间": "编译",
-        "网络层版本": "NWK",
-        "APS层版本": "APS",
-        "APP层版本": "APP",
-        "PHY层版本": "PHY",
-        "载波MAC层版本": "MAC",
-        "芯片程序版本": "DSP",
-        "硬件型号": "硬件",
-        "芯片型号": "芯片型号",
-    }
+    priority_keys = _SUMMARY_PRIORITY
 
     parts = []
     for name, value in results:
@@ -951,6 +956,43 @@ def format_lme_info_summary(results: List[Tuple[str, str]], max_len: int = 120) 
     if len(result) > max_len:
         result = result[:max_len - 3] + "..."
     return result if result else "已解析"
+
+
+def format_lme_info_detail(results: List[Tuple[str, str]], sep: str = " ") -> str:
+    """**全量**条目格式化：给「详细版本」这类需要看全的列用。
+
+    顺序 = 先按 `_SUMMARY_PRIORITY` 的关键字段（厂商/芯片/版本/工程版本/编译/NWK/APS/…），
+    再按应答里的原始顺序补齐其余条目（已定义名优先于「数据NN」厂商扩展）。
+    值为空 / 未写入的条目跳过；完全相同的「名称+值」只保留一次（4.6 里常有 13 条同样的复位计数）。
+    不做长度截断，需要时由调用方裁剪或塞进 tooltip。
+    """
+    if not results:
+        return "无数据"
+    ordered: List[Tuple[str, str]] = []
+    seen = set()
+    for key in _SUMMARY_PRIORITY:
+        for name, value in results:
+            if name != key or not _lme_value_usable(value):
+                continue
+            if (name, value) in seen:
+                continue
+            seen.add((name, value))
+            ordered.append((_SUMMARY_PRIORITY[key], value))
+    for name, value in results:
+        if not _lme_value_usable(value) or (name, value) in seen:
+            continue
+        seen.add((name, value))
+        ordered.append((name, value))
+    if not ordered:
+        return "已解析"
+    return sep.join(f"{name}:{value}" for name, value in ordered)
+
+
+def _lme_value_usable(value: str) -> bool:
+    """条目值是否值得显示（过滤空值/占位）"""
+    if not value:
+        return False
+    return value.strip() not in ("空", "未写入", "（空）", "-")
 
 
 # ======================================================================

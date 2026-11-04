@@ -232,6 +232,9 @@ HIDDENIMPORTS = [
     'hdc10_parser',
     'hdc10_mme_parser',
     'protocol_registry',  # 协议能力注册表（main_gui 顶层 import，显式声明保险）
+    'gdw_test_flow_extra',  # 协议7 流程测试：文档补充用例 + 负面用例（函数级 import）
+    'gdw_test_flow_custom',  # 协议7 流程测试：自定义用例 JSON 层（函数级 import）
+    'gdw_flow_editor',  # 协议7 流程测试：用例管理对话框（函数级 import）
     'parser_registry',  # 解析器懒加载（同上）
     'wakeup_prefix',  # 前导 FE 唤醒字节单一来源（协议8/6 解析器与校验器顶层 import）
     'validator.hdc10_validator',

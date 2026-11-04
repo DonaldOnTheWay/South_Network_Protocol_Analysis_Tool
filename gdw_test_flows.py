@@ -29,8 +29,13 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+# 载波频段文字（表 05H F16 枚举）—— 单一来源在 gdw_test_network，不再抄第二份。
+# gdw_test_network 不 import 本模块，故此处模块级 import 不会成环。
+from gdw_test_network import CARRIER_BANDS as CARRIER_BAND_TEXT
 
 KIND_SEND = "send"
 KIND_WAIT = "wait"
@@ -40,6 +45,8 @@ KIND_NOTE = "note"
 KIND_RESET_STA = "reset_sta"      # 下发 STA 硬件初始化（645 广播），让 STA 重新入网并上报
 KIND_POLL = "poll"                # 轮询：重复下发同一条命令直到校验通过或超时
 KIND_SERVE = "serve"              # 服务路由请求：14H F1 回抄读内容、14H F2 回系统时间，直到 until 命中
+KIND_SILENCE = "silence"          # 静默窗口：窗口内收到任何未声明的上行即判不合格（广播 T2）
+KIND_EXPECT_STA = "expect_sta"    # 观测 STA 域（从节点串口）：CCO 是否发出期望的下行帧
 
 #: 只有「主动上报类」才需要测试系统回 00H F1 确认。
 #: **不要包含 14H F1**（路由请求抄读内容）：它要的是回抄读内容（14H F1 下行），
@@ -64,6 +71,14 @@ CHECK_DELAY = "broadcast_delay"         # 03H F9：广播通信延迟时间 > 0
 CHECK_BROADCAST_ACK = "broadcast_ack"   # 05H F3：确认帧带等待时间 T2 > 0
 CHECK_ROUTE_STATE = "route_state"       # 10H F4：工作标志=停止、路由完成=完成
 CHECK_READ_MATCH = "read_match"         # 抄读结果须与虚拟表应答的数据内容一致
+CHECK_MASTER_ADDR = "master_addr_diff"  # 03H F4：主节点地址必须 ≠ 终端（CCO）地址
+CHECK_NODE_COUNT = "node_count"         # 10H F1：从节点数量 == 组网从节点数
+CHECK_BAND = "band_valid"               # 03H F16：宽带载波频段 ∈ 0~3
+CHECK_BAND_ECHO = "band_echo"           # 03H F16 回读频段 == 组网参数里的载波频段
+
+#: STA 域（从节点串口）帧的协议类别 —— `match_sta_frame` 的 ``sta_filter["域"]``
+STA_DOMAIN_645 = "645"
+STA_DOMAIN_698 = "698"
 
 
 
@@ -90,6 +105,23 @@ class FlowStep:
     #: 上报 `13H F1`；干等确认只会白超时判失败）
     no_reply: bool = False
     hint: str = ""
+    #: 预期**否认**码（00H/50H F2 的错误状态字）：``None`` = 不预期否认；
+    #: 单个 int 或 int 序列（同一非法帧在不同固件上可能回 1 无效数据单元 / 2 长度错）
+    expect_denial: Any = None
+    #: 失败后按序改试的命令 key（如 `01H F2 参数区初始化` → `11H F2 删除从节点`）
+    alt_keys: Tuple[str, ...] = ()
+    #: 多节点分帧下发（`11H F1 添加从节点` 按组网参数循环添加，文档要求）
+    split_nodes: bool = False
+    #: 步骤自带的从节点地址列（**与组网参数无关**，组网参数只放得下 2 个节点）：
+    #: 并发抄表测上限要 100 个地址，建档也要能一次铺开。空 = 用组网参数的从节点
+    addrs: Tuple[str, ...] = ()
+    #: 每条帧里放几个地址（建档分批：100 个地址 10 个一批 = 10 帧；0/1 = 一个地址一帧）
+    batch: int = 0
+    #: **并发连发**：按 `addrs` 顺序逐帧连发、不逐帧等应答；收到否认即停，并记录
+    #: 「发到第几帧被否认」= 被测的最大并发数（用户口径）
+    concurrent: bool = False
+    #: ``KIND_EXPECT_STA`` 用：STA 域帧的过滤条件（见 :func:`match_sta_frame`）
+    sta_filter: Dict[str, Any] = field(default_factory=dict)
 
     def expect_afn_fn(self) -> Optional[Tuple[int, int]]:
         return (self.afn, self.fn) if self.afn >= 0 else None
@@ -104,6 +136,8 @@ class FlowCase:
     desc: str
     steps: List[FlowStep] = field(default_factory=list)
     source: str = ""                                # 出处（xlsx 行号/文档章节）
+    #: 内置用例（`FLOW_CASES`）为 True；文档补充用例与用户自定义用例为 False
+    builtin: bool = True
 
     @property
     def needs_slave(self) -> bool:
@@ -114,7 +148,9 @@ class FlowCase:
 
 def _init_params() -> FlowStep:
     return FlowStep(KIND_SEND, "参数区初始化（清空模块内已有档案）", key="01-2", timeout=6.0,
-                    hint="不先初始化，随后 11H F1 会回「错误状态字=6 表号重复」")
+                    alt_keys=("11-2",),
+                    hint="不先初始化，随后 11H F1 会回「错误状态字=6 表号重复」；"
+                         "初始化被拒（部分固件不实现 01H F2）时自动改试「11H F2 删除从节点」")
 
 
 def _power_on() -> FlowStep:
@@ -157,7 +193,9 @@ def read_round_steps(label: str = "抄表") -> List[FlowStep]:
 
 def _add_nodes() -> FlowStep:
     return FlowStep(KIND_SEND, "添加从节点档案（组网参数里的从节点）", key="11-1", timeout=6.0,
-                    hint="列表与数量由「组网参数」自动填，地址低字节在前")
+                    split_nodes=True,
+                    hint="列表与数量由「组网参数」自动填，地址低字节在前；"
+                         "按组网参数逐个从节点各发一帧（文档要求循环添加）")
 
 
 def _query_archive(count_note: str = "") -> FlowStep:
@@ -177,6 +215,19 @@ JOIN_WINDOW = 300.0
 #: 组网期间轮询拓扑的间隔
 JOIN_POLL_INTERVAL = 15.0
 
+#: 并发抄表测上限用的默认从节点个数（用户口径：至少 100 个地址）
+CONCURRENT_NODES = 100
+
+
+def default_addrs(count: int = CONCURRENT_NODES, start: int = 1) -> Tuple[str, ...]:
+    """生成 ``count`` 个 12 位从节点地址（默认 000000000001 ~ 000000000100）。"""
+    try:
+        total = int(count)
+    except (TypeError, ValueError):
+        total = 0
+    base = max(0, int(start))
+    return tuple(f"{base + i:012d}" for i in range(max(0, total)))
+
 
 def prerequisite_steps(window: float = JOIN_WINDOW) -> List[FlowStep]:
     """「重新执行一次建档 + 组网」的完整前置序列。
@@ -195,7 +246,9 @@ def prerequisite_steps(window: float = JOIN_WINDOW) -> List[FlowStep]:
     return [
         _init_params(),
         _add_nodes(),
-        FlowStep(KIND_SEND, "查询从节点数量 (10H F1)", key="10-1", timeout=6.0),
+        FlowStep(KIND_SEND, "查询从节点数量 (10H F1)", key="10-1", timeout=6.0,
+                 check=CHECK_NODE_COUNT,
+                 hint="判定：模块档案里的从节点数量必须与组网参数的从节点个数一致"),
         _query_archive(),
         FlowStep(KIND_RESET_STA, "控制 STA 复位（645 广播）：让从节点重新入网并主动上报",
                  timeout=6.0, needs_slave=True,
@@ -222,10 +275,12 @@ FLOW_CASES: List[FlowCase] = [
                      hint="硬件初始化后模块几乎立刻上报；本步先查「已收到的上行缓存」，"
                           "早到的帧也会被认到，不会因为等早了/等晚了而漏掉"),
             FlowStep(KIND_SEND, "主动查询「本地通信模块运行模式信息」(03H F10)", key="03-10",
-                     timeout=6.0, optional=True,
-                     hint="word 要求：模块未主动上报时，能源控制器应在 1min 内主动下发本命令"),
+                     timeout=6.0,
+                     hint="word 2.2.2：模块 1min 内未主动上报时能源控制器必须主动下发；"
+                          "无应答即判不合格（本步不再是可选项）"),
             FlowStep(KIND_SEND, "查询主节点地址 (03H F4)", key="03-4", timeout=6.0,
-                     hint="应答里的主节点地址应与终端地址不一致（word 第 113 行）"),
+                     check=CHECK_MASTER_ADDR,
+                     hint="应答里的主节点地址必须与终端地址不一致（word 第 113 行）"),
             FlowStep(KIND_SEND, "设置主节点地址 (05H F1)", key="05-1", timeout=6.0,
                      hint="主节点地址取「组网参数」里的 CCO 地址；期望确认帧"),
         ],
@@ -237,7 +292,9 @@ FLOW_CASES: List[FlowCase] = [
         steps=[
             _init_params(),
             _add_nodes(),
-            FlowStep(KIND_SEND, "读取从节点数量 (10H F1)", key="10-1", timeout=6.0),
+            FlowStep(KIND_SEND, "读取从节点数量 (10H F1)", key="10-1", timeout=6.0,
+                     check=CHECK_NODE_COUNT,
+                     hint="判定：模块档案里的从节点数量必须与组网参数的从节点个数一致"),
             _query_archive(),
             FlowStep(KIND_NOTE, "判定：10H F2 返回的档案地址应包含组网参数里的全部从节点地址"),
         ],
@@ -314,8 +371,11 @@ FLOW_CASES: List[FlowCase] = [
             FlowStep(KIND_SEND, "启动广播 (05H F3)：645 帧按 T1 修正后下发", key="05-3", timeout=6.0,
                      check=CHECK_BROADCAST_ACK,
                      hint="word 第 145 行：645 帧未按 T1 修正判不合格"),
-            FlowStep(KIND_SLEEP, "按确认帧里的等待时间 T2 静默观察（本例取 5s，实际按应答 T2 调整）",
-                     timeout=5.0),
+            FlowStep(KIND_SILENCE,
+                     "T2 静默观察：窗口内收到任何上行即判不合格（按确认帧 T2 调整本步超时）",
+                     timeout=5.0,
+                     hint="word 第 146 行：T2 内不应收到模块的任何报文；"
+                          "窗口内真的静默才通过（旧实现是固定 sleep，永远通过 = 假通过）"),
             FlowStep(KIND_NOTE, "判定：T2 内不应收到模块的任何报文；超时未收到 05H F3 应答亦判不合格"),
         ],
     ),
@@ -342,11 +402,80 @@ FLOW_CASES: List[FlowCase] = [
     ),
 ]
 
+#: 内置用例的 fid → 用例（**只含内置**；完整查找请用 :func:`flow_case`）
 FLOW_BY_ID: Dict[str, FlowCase] = {c.fid: c for c in FLOW_CASES}
+
+#: 自定义用例缓存：{(绝对路径, mtime_ns, size): [FlowCase, ...]}
+_CUSTOM_CACHE: Dict[str, Any] = {"key": None, "cases": []}
+
+
+def builtin_cases() -> List[FlowCase]:
+    """内置用例（xlsx 70~78 行那 9 条）。"""
+    return list(FLOW_CASES)
+
+
+def _extra_cases() -> List[FlowCase]:
+    """文档补充用例（`gdw_test_flow_extra.py`）；该模块依赖本模块，故只能函数级 import。"""
+    try:
+        import gdw_test_flow_extra as extra
+    except Exception:                       # 缺模块/语法错不应让整个流程页打不开
+        return []
+    return list(getattr(extra, "EXTRA_CASES", ()) or ())
+
+
+def _custom_cases() -> List[FlowCase]:
+    """用户自定义用例（`gdw_test_flow_custom.json`），按文件 mtime/size 缓存。
+
+    每次选中用例都会查一次，逐次读盘会让界面变卡；用 ``(路径, mtime_ns, size)``
+    做键即可在文件被改写后自动失效。
+    """
+    try:
+        import gdw_test_flow_custom as custom
+
+        path = custom.store_path()
+    except Exception:                       # 自定义层不可用时按「没有自定义用例」处理
+        return []
+    try:
+        st = os.stat(path)
+        key: Any = (os.path.abspath(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (os.path.abspath(path), None, None)
+    if _CUSTOM_CACHE.get("key") == key:
+        return list(_CUSTOM_CACHE.get("cases") or ())
+    try:
+        cases, _errors = custom.load_cases(path)
+    except Exception:
+        cases = []
+    _CUSTOM_CACHE["key"] = key
+    _CUSTOM_CACHE["cases"] = list(cases)
+    return list(cases)
+
+
+def invalidate_custom_cache() -> None:
+    """丢弃自定义用例缓存（保存/导入自定义用例后调用，保证立刻可见）。"""
+    _CUSTOM_CACHE["key"] = None
+    _CUSTOM_CACHE["cases"] = []
+
+
+def all_cases() -> List[FlowCase]:
+    """全部用例：内置 9 条 + 文档补充 + 用户自定义（坏条目已在加载时跳过）。"""
+    return builtin_cases() + _extra_cases() + _custom_cases()
 
 
 def flow_case(fid: str) -> Optional[FlowCase]:
-    return FLOW_BY_ID.get(fid)
+    """按 fid 查用例：内置 → 文档补充 → 自定义（先命中先返回）。"""
+    case = FLOW_BY_ID.get(fid)
+    if case is not None:
+        return case
+    if not fid:
+        return None
+    for case in _extra_cases():
+        if case.fid == fid:
+            return case
+    for case in _custom_cases():
+        if case.fid == fid:
+            return case
+    return None
 
 
 # ── 执行引擎 ────────────────────────────────────────────────────────────
@@ -489,7 +618,7 @@ def flow_titles(case: FlowCase) -> List[str]:
 
 
 def cases_needing_slave() -> List[str]:
-    return [c.name for c in FLOW_CASES if c.needs_slave]
+    return [c.name for c in all_cases() if c.needs_slave]
 
 
 def _rows_map(rows: Sequence[Tuple]) -> Dict[str, Tuple]:
@@ -501,10 +630,32 @@ def _row_text(rows: Dict[str, Tuple], name: str) -> str:
     return str(row[2]) if row else ""
 
 
+def _as_int(text: Any) -> Optional[int]:
+    """解析值 → 整数（容忍 ``"2"`` / ``"2(0x02)"`` / ``"10"``；取不到返回 None）。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    for prefix in ("0x", "0X"):
+        if raw.lower().startswith(prefix.lower()):
+            try:
+                return int(raw[2:].split("(")[0].split()[0], 16)
+            except (TypeError, ValueError):
+                return None
+    try:
+        return int(float(raw.split("(")[0].split()[0]))
+    except (TypeError, ValueError):
+        return None
+
+
 def run_check(name: str, rows: Sequence[Tuple], archive: Sequence[str] = (),
-              expected: Sequence[bytes] = ()
+              expected: Sequence[bytes] = (),
+              context: Optional[Dict[str, Any]] = None
               ) -> Tuple[bool, str]:
-    """按 ``FlowStep.check`` 校验收到的数据帧内容。返回 (是否通过, 说明)。"""
+    """按 ``FlowStep.check`` 校验收到的数据帧内容。返回 (是否通过, 说明)。
+
+    ``context`` 供需要「与组网参数比对」的判定使用（``cco_addr`` / ``band`` /
+    ``slave_addrs``）；缺字段时按「无法判定」判失败，**不冒充通过**。
+    """
     if not name:
         return True, ""
     table = _rows_map(rows)
@@ -569,6 +720,50 @@ def run_check(name: str, rows: Sequence[Tuple], archive: Sequence[str] = (),
         route = _row_text(table, "运行状态字")
         ok = ("停止" in status) and ("完成" in route or not route)
         return ok, f"工作标志={status or '?'}；{route or ''}".strip("；")
+
+    if name == CHECK_MASTER_ADDR:
+        row = table.get("主节点地址")
+        addr = str(row[2] if row else "").strip().upper()
+        if not addr:
+            return False, "未解析出主节点地址"
+        cco = str((context or {}).get("cco_addr") or "").strip().upper()
+        if not cco:
+            return False, ("组网参数未填 CCO 地址，无法判定主节点地址是否与终端地址不一致")
+        if addr == cco:
+            return False, f"主节点地址 {addr} 与终端地址相同（word 第 113 行要求不一致）"
+        return True, f"主节点地址 {addr} ≠ 终端地址 {cco}"
+
+    if name == CHECK_NODE_COUNT:
+        text = _row_text(table, "从节点总数量") or _row_text(table, "从节点数量")
+        count = _as_int(text)
+        if count is None:
+            return False, f"未解析出从节点数量（{text or '无该字段'}）"
+        if not archive:
+            return False, "组网参数未填从节点地址，无法比对数量"
+        if count == len(archive):
+            return True, f"从节点数量={count}，与组网 {len(archive)} 个一致"
+        return False, f"从节点数量={count} ≠ 组网 {len(archive)} 个"
+
+    if name == CHECK_BAND:
+        text = _row_text(table, "宽带载波频段")
+        band = _as_int(text)
+        if band is None:
+            return False, f"未解析出宽带载波频段（{text or '无该字段'}）"
+        if 0 <= band <= 3:
+            return True, f"宽带载波频段={band}（{CARRIER_BAND_TEXT.get(band, '')}）"
+        return False, f"宽带载波频段={band} 超出 0~3（{text}）"
+
+    if name == CHECK_BAND_ECHO:
+        text = _row_text(table, "宽带载波频段")
+        band = _as_int(text)
+        if band is None:
+            return False, f"未解析出宽带载波频段（{text or '无该字段'}）"
+        want = (context or {}).get("band")
+        if want is None:
+            return False, "未取到组网参数里的载波频段，无法比对回读值"
+        if band == _as_int(want):
+            return True, f"回读频段={band}，与设置值一致"
+        return False, f"回读频段 {band} ≠ 设置值 {want}"
 
     if name == CHECK_READ_MATCH:
         payload = b""
@@ -662,6 +857,91 @@ def is_valid_meter_response(frame: bytes) -> bool:
         return (ctrl & 0x80) == 0x80 and length > 0
     # 698：GET-Response 的 APDU 标签 0x85
     return 0x85 in frame[8:14]
+
+
+# ── STA 域（从节点串口）观测判定 ────────────────────────────────────────
+def _is_645_frame(data: bytes) -> bool:
+    """645 结构自证：``68H + 6B 地址 + 68H``。"""
+    return len(data) >= 12 and data[0] == 0x68 and data[7] == 0x68
+
+
+def match_sta_frame(step: "FlowStep", frame: bytes) -> Tuple[bool, str]:
+    """判定 STA 域（从节点串口）收到的一帧是否即 ``step`` 期望。
+
+    ``sta_filter`` 支持的键（编辑器只填这些，判据只在这里实现）：
+
+    - ``域``     ``"645"`` / ``"698"``：先按结构自证，再按各自的过滤条件判；
+    - ``控制码`` (int) 645 用，比较 ``ctrl & 0x1F``（主站请求的控制码，如 0x11 读数据）；
+    - ``DI``     (str) 645 用，4 字节数据标识**去 0x33 加扰后**按书写序还原的前缀
+                 （如 ``"0001"`` = 正向有功电能量，``"04001501"`` = 主动上报状态字）；
+    - ``APDU``   (int) 698 用，APDU 标签在帧内出现即认（与 ``is_valid_meter_response``
+                 同一口径：SA 长度可变，固定偏移不可靠）。
+
+    未给 ``域`` 时任一 645/698 形态都算命中（只回「是什么帧」）。返回 (是否命中, 说明)。
+    """
+    data = bytes(frame or b"")
+    if not data:
+        return False, "空帧"
+    flt: Dict[str, Any] = dict(getattr(step, "sta_filter", None) or ())
+    domain = str(flt.get("域") or "").strip()
+
+    if domain == STA_DOMAIN_645:
+        if not _is_645_frame(data):
+            return False, "不是 645 帧（缺 68H+6B 地址+68H 结构）"
+        return _match_645_filter(data, flt)
+    if domain == STA_DOMAIN_698:
+        if data[0] != 0x68:
+            return False, "不是 698.45 帧（首字节非 68H）"
+        if _is_645_frame(data):
+            return False, "不是 698.45 帧（第 8 字节又是 68H，是 645 形态）"
+        return _match_698_filter(data, flt)
+    # 未指定域：按结构判形态即可
+    if _is_645_frame(data):
+        return True, f"645 帧（控制码={data[8]:02X}H）"
+    if data[0] == 0x68:
+        return True, "698.45 帧"
+    return False, "既不是 645 也不是 698.45 帧"
+
+
+def _match_645_filter(data: bytes, flt: Dict[str, Any]) -> Tuple[bool, str]:
+    ctrl = data[8]
+    want_ctrl = flt.get("控制码")
+    if want_ctrl is not None:
+        try:
+            ctrl_code = int(want_ctrl) & 0x1F
+        except (TypeError, ValueError):
+            return False, f"过滤条件里的控制码非法：{want_ctrl!r}"
+        if (ctrl & 0x1F) != ctrl_code:
+            return False, f"645 控制码={ctrl & 0x1F:02X}H，期望 {ctrl_code:02X}H"
+    want_di = str(flt.get("DI") or "").strip().upper()
+    di = ""
+    if want_di:
+        if len(data) < 14:
+            return False, "645 帧不足 4 字节数据标识"
+        # 数据域逐字节 +0x33 加扰：先还原，再按书写序（低字节在前 → 反转）拼
+        plain = bytes((b - 0x33) & 0xFF for b in data[10:14])
+        di = plain[::-1].hex().upper()
+        if not di.startswith(want_di):
+            return False, f"645 数据标识={di}，期望前缀 {want_di}"
+    parts = [f"645 控制码={ctrl & 0x1F:02X}H"]
+    if di:
+        parts.append(f"DI={di}")
+    return True, " ".join(parts)
+
+
+def _match_698_filter(data: bytes, flt: Dict[str, Any]) -> Tuple[bool, str]:
+    want_apdu = flt.get("APDU")
+    if want_apdu is None:
+        return True, "698.45 帧"
+    try:
+        tag = int(want_apdu) & 0xFF
+    except (TypeError, ValueError):
+        return False, f"过滤条件里的 APDU 非法：{want_apdu!r}"
+    # APDU 起点随 SA 长度变化（通配/单地址/组/广播长度不同），故按「帧内出现」判，
+    # 与 is_valid_meter_response 同一口径。
+    if tag not in bytes(data)[8:19]:
+        return False, f"帧内未见 APDU 标签 0x{tag:02X}（前 19 字节）"
+    return True, f"698 APDU=0x{tag:02X}"
 
 
 def default_archive_addrs(net) -> List[str]:

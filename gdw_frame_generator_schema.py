@@ -753,19 +753,23 @@ GDW_AFNFN_SCHEMA: Dict[Tuple[int, int], Dict[str, Any]] = {
     (0xF1, 1): {
         "name": "集中器主动并发抄表",
         "direction": "down",
+        # 权威依据：《集中器本地通信模块接口-2024》6.5.15 表 135（下行）——
+        #   规约类型(1B) + 保留(1B) + 报文长度L(2B, BIN) + 报文内容(L)
+        # **一帧只抄一块表**：表地址在 376.2 的「目的地址(A3)」里，数据单元里没有
+        # 数量/地址列表。旧 schema 写成「数量+地址列表」与解析器、文档都对不上
+        # （生成的帧解析出来是「规约类型=1/保留/报文长度=0/报文内容空」），1.26.20 修正。
         "fields": [
-            {"name": "从节点数量", "type": "uint8", "default": 1},
-            {"name": "从节点列表", "type": "list",
-             "count_field": "从节点数量",
-             "item_fields": [
-                 {"name": "从节点地址", "type": "bcd", "length": 6, "default": "000000000000"},
-                 {"name": "通信协议类型", "type": "enum", "default": 0,
-                  "enum_map": {0: "透明传输", 1: "DL/T 645-1997", 2: "DL/T 645-2007", 3: "DL/T 698.45"}},
-                 {"name": "报文长度", "type": "uint8", "default": 0},
-                 {"name": "报文内容", "type": "bytes", "default": ""},
-             ]},
+            {"name": "规约类型", "type": "enum", "default": 2,
+             "enum_map": {0: "透明传输", 1: "DL/T 645-1997", 2: "DL/T 645-2007", 3: "DL/T 698.45"},
+             "description": "被测电能表的通信协议"},
+            {"name": "保留", "type": "uint8", "default": 0},
+            {"name": "报文长度", "type": "uint16", "endian": "little", "default": 0,
+             "length_field": "报文内容", "description": "由报文内容长度自动填（表 135：BIN 2 字节）"},
+            {"name": "报文内容", "type": "bytes", "default": "",
+             "description": "待抄读的电能表协议报文（645/698 读帧）"},
         ],
-        "doc": "<b>AFN=F1H F1</b><br>数据单元：数量(1B)+[地址(6B)+协议类型(1B)+报文长度(1B)+报文内容]*n"
+        "doc": "<b>AFN=F1H F1</b><br>数据单元（表 135）：规约类型(1B)+保留(1B)+报文长度L(BIN 2B)"
+               "+报文内容(L)<br><b>一帧一块表</b>：表地址填在 376.2 的「目的地址(A3)」里"
     },
     (0xF1, 2): {"name": "集中器确认主动上报", "direction": "down", "fields": [],
                 "doc": "<b>AFN=F1H F2</b><br>无数据单元。"},

@@ -32,8 +32,9 @@ from __future__ import annotations
 import json
 import os
 import re
+from dataclasses import replace
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (QBrush, QColor, QDesktopServices, QFont, QTextCharFormat,
@@ -67,6 +68,9 @@ RAW_ROW_LIMIT = 2000
 LOG_MAX_BLOCKS = 4000
 #: 测试系统回确认帧（00H F1）时填的「等待时间」，单位 s（表 9 注：应不超过 5s；用户口径 1s）
 ACK_WAIT_SECONDS = 1
+#: 并发连发两帧之间的间隔（ms）：**不等待应答**，只给事件循环一个插入点
+#: （0 会让「收到否认立即停」永远慢一拍 —— 100 帧会在一次事件循环里全发完）
+CONCURRENT_SEND_INTERVAL_MS = 1
 #: 树/日志/底部 tabs 的空间下限（照 698 页 1000×700 实测值，低于它会压掉内容）
 TREE_MIN_HEIGHT = 160
 LOG_MIN_HEIGHT = 120
@@ -172,7 +176,6 @@ class GdwTestWidget(QWidget):
         self._flow_runner = None
         self._flow_action = None
         self._flow_case = None
-        self._flow_sent = False
         self._flow_queue: List[Any] = []
         #: 流程用例的测试结果 {fid: "通过"/"失败"/"跳过"/"进行中"/"未执行"}（左树第三列）
         self._flow_results: Dict[str, str] = {}
@@ -192,6 +195,15 @@ class GdwTestWidget(QWidget):
         self._flow_rx_buffer: List[List[Any]] = []
         #: 最近一条 14H F3 上行（延时修正请求）→ {addr, delay_ms, content}
         self._flow_delay_req: Optional[Dict[str, Any]] = None
+        #: 备用命令已改试到第几个（步骤 index → 已用次数），见 `_flow_try_alt`
+        self._flow_alt_used: Dict[int, int] = {}
+        #: 并发连发（`FlowStep.concurrent`）：待发帧 / 已发帧数
+        self._flow_concurrent_frames: List[Tuple[bytes, str]] = []
+        self._flow_concurrent_sent = 0
+        self._flow_concurrent_step = None
+        self._flow_concurrent_timer = QTimer(self)
+        self._flow_concurrent_timer.setSingleShot(False)
+        self._flow_concurrent_timer.timeout.connect(self._send_next_concurrent)
         self._flow_timer = QTimer(self)
         self._flow_timer.setSingleShot(True)
         self._flow_timer.timeout.connect(self._on_flow_timeout)
@@ -257,13 +269,17 @@ class GdwTestWidget(QWidget):
 
     def refresh(self) -> None:
         """重建当前页的树（自定义页增删后调用；其它页无副作用）。"""
-        tree = self._trees.get(self._page)
+        self._rebuild_tree(self._page)
+
+    def _rebuild_tree(self, page: str) -> None:
+        """清空并重建某一页的树（`refresh` 的指定页版本）。"""
+        tree = self._trees.get(page)
         if tree is None:
             return
         tree.blockSignals(True)
         tree.clear()
         tree.blockSignals(False)
-        self._ensure_tree(self._page)
+        self._ensure_tree(page)
 
     def _on_channel_state(self, text: str, ready: bool) -> None:
         """通道状态：只用一个串口图标 + 颜色表示（完整文案放 tooltip）。
@@ -1812,6 +1828,17 @@ class GdwTestWidget(QWidget):
         self.lbl_sta_sim.setStyleSheet("color:#6E7781;")
         self.lbl_sta_proto = QLabel("协议：—")
         self.lbl_sta_proto.setStyleSheet("color:#6E7781;")
+        # 向从节点发原始帧：645 主动上报状态字 / 698 停电上报这类没有组帧器的场景，
+        # 由人工粘一帧发到 STA 总线（值域/校验在这里只做 HEX 解析，不校验协议）
+        self.edit_sta_raw = QLineEdit()
+        self.edit_sta_raw.setPlaceholderText("向从节点发帧（HEX）")
+        self.edit_sta_raw.setMinimumWidth(220)
+        self.edit_sta_raw.setToolTip(
+            "把一帧原始报文（HEX）发到从节点串口，模拟电能表/STA 主动发起\n"
+            "典型用途：645 主动上报状态字(04001501)、698 停电上报（本工具无对应组帧器）")
+        self.btn_sta_send_raw = QPushButton("发送到从节点")
+        self.btn_sta_send_raw.setToolTip("需要先「启动从节点模拟」（它持有从节点串口的写句柄）")
+        self.btn_sta_send_raw.clicked.connect(self._send_sta_raw)
 
         grid.addWidget(QLabel("端口"), 0, 0)
         grid.addWidget(self.combo_sta_port, 0, 1)
@@ -1825,6 +1852,8 @@ class GdwTestWidget(QWidget):
         grid.addWidget(self.btn_sta_sim, 0, 9)
         grid.addWidget(self.lbl_sta_sim, 0, 10, 1, 2)
         grid.addWidget(self.lbl_sta_proto, 1, 0, 1, 6)
+        grid.addWidget(self.edit_sta_raw, 1, 6, 1, 4)
+        grid.addWidget(self.btn_sta_send_raw, 1, 10, 1, 2)
         grid.setColumnStretch(11, 1)
         self._refresh_sta_ports()
         return box
@@ -1926,6 +1955,8 @@ class GdwTestWidget(QWidget):
             port, int(self.combo_sta_baud.currentText() or 115200),
             self.combo_sta_parity.currentText(), stopbits, proto_set, addr)
         svc.log.connect(lambda msg: self._log(f"[从节点模拟] {msg}", "info"))
+        # STA 域观测：CCO 下发给从节点的帧只在这条串口上，流程的 `expect_sta` 步靠它判定
+        svc.frame_exchanged.connect(self._on_sta_frame)
         self._sta_sim = svc
         svc.start()
         self.btn_sta_sim.setText("停止从节点模拟")
@@ -1934,6 +1965,49 @@ class GdwTestWidget(QWidget):
         self.lbl_sta_proto.setText(f"协议：{svc.protocol_text()}｜虚拟表地址：{addr or '按档案'}")
         self._log(f"[从节点模拟] 启动 {port}（{svc.protocol_text()}）", "ok")
         return True
+
+    def _on_sta_frame(self, req_hex: str, _responses) -> None:
+        """STA 域收到一帧（从节点串口）→ 供 ``expect_sta`` 步骤判定。
+
+        `StaSimService.frame_exchanged` 是观测 STA 域的唯一信号源（645 两条分支与
+        `_write_all` 都会 emit），**不要另开串口**。
+        """
+        import gdw_test_flows as flows
+
+        action = self._flow_action
+        if action is None or action.kind != flows.KIND_EXPECT_STA:
+            return
+        try:
+            raw = bytes.fromhex(str(req_hex or "").replace(" ", ""))
+        except ValueError:
+            return
+        ok, desc = flows.match_sta_frame(action.step, raw)
+        if ok:
+            self._log(f"  → 观测到 STA 域下行：{desc}", "ok")
+            self._flow_done(True, desc)
+
+    def _send_sta_raw(self) -> None:
+        """把输入框里的原始报文发到从节点串口（人工造 STA 主动发起的帧）。"""
+        if self._sta_sim is None or not self._sta_sim.isRunning():
+            self._log("[提示] 未启动从节点模拟，无法向从节点发帧", "warn")
+            QMessageBox.information(self, "向从节点发帧",
+                                    "请先点「启动从节点模拟」（它持有从节点串口的写句柄）")
+            return
+        text = self.edit_sta_raw.text().strip()
+        try:
+            frame = _parse_hex(text)
+        except Exception as exc:                   # noqa: BLE001 - 复用 core 的中文原因
+            self._log(f"[失败] 发往从节点的报文不是有效 HEX：{exc}", "fail")
+            QMessageBox.warning(self, "向从节点发帧", f"不是有效的 HEX：{exc}")
+            return
+        if not frame:
+            self._log("[提示] 发往从节点的报文为空", "warn")
+            return
+        if not self._sta_sim.send_frame(frame):
+            self._log("[失败] 从节点模拟拒绝发送（发送队列不可用）", "fail")
+            return
+        self._add_raw_row("TX", frame, "发往从节点")
+        self._log(f"[TX→从节点] ({len(frame)}B) {_fmt(frame)}", "tx")
 
     def _ensure_sta_sim_for_flow(self) -> None:
         """开始跑流程前：若勾选用例需要从节点，按组网参数自动起虚拟表。"""
@@ -1986,12 +2060,18 @@ class GdwTestWidget(QWidget):
         self.btn_flow_stop.setEnabled(False)
         self.btn_flow_skip = QPushButton("跳过本步")
         self.btn_flow_skip.setEnabled(False)
+        self.btn_flow_manage = QPushButton("用例管理…")
+        self.btn_flow_manage.setToolTip(
+            "新增/编辑/导入/导出自定义流程用例（存 gdw_test_flow_custom.json，\n"
+            "以后加用例不必改代码）；内置 9 条与文档补充用例是只读的，可「复制」成自己的")
         self.btn_flow_start.clicked.connect(self._on_flow_start)
         self.btn_flow_stop.clicked.connect(self._on_flow_stop)
         self.btn_flow_skip.clicked.connect(lambda: self._flow_done(True, "人工跳过"))
+        self.btn_flow_manage.clicked.connect(self._open_flow_editor)
         row.addWidget(self.btn_flow_start)
         row.addWidget(self.btn_flow_stop)
         row.addWidget(self.btn_flow_skip)
+        row.addWidget(self.btn_flow_manage)
         self.lbl_flow_state = QLabel("")
         self.lbl_flow_state.setStyleSheet("color:#6E7781;")
         row.addWidget(self.lbl_flow_state, 1)
@@ -2002,6 +2082,25 @@ class GdwTestWidget(QWidget):
         import gdw_test_flows as flows
 
         return flows.flow_case(key)
+
+    def _open_flow_editor(self) -> None:
+        """打开「用例管理」对话框（新增/复制/编辑/导入/导出自定义用例）。"""
+        from gdw_flow_editor import FlowCaseEditorDialog
+
+        dlg = FlowCaseEditorDialog(self)
+        dlg.saved.connect(self._on_flow_cases_changed)
+        dlg.exec()
+
+    def _on_flow_cases_changed(self) -> None:
+        """自定义用例保存后：重建用例树 + 尽量保留当前选中项。"""
+        import gdw_test_flows as flows
+
+        fid = self._flow_case.fid if self._flow_case is not None else ""
+        self._rebuild_tree(core.PAGE_FLOW)
+        self._flow_case = flows.flow_case(fid) if fid else None
+        self._render_flow_steps(self._flow_case)
+        total = core.leaf_count(core.PAGE_FLOW)
+        self._log(f"[信息] 自定义用例已更新：流程页共 {total} 条用例", "info")
 
     def _on_flow_case_selected(self, key: str) -> None:
         case = self._flow_case_by_key(key)
@@ -2109,6 +2208,9 @@ class GdwTestWidget(QWidget):
         self._flow_overrides = overrides
         self._flow_queue = list(cases)
         self._flow_rx_buffer = []          # 新一轮流程：清空上行缓存
+        self._flow_alt_used = {}
+        self._stop_concurrent()
+        self._flow_concurrent_sent = 0
         for case in cases:                 # 第三列先标「排队中」，执行时再改「进行中」
             self._set_flow_result(case.fid, "排队中")
         # 需要从节点的用例：先按组网参数把虚拟表（645/698）拉起来
@@ -2132,9 +2234,15 @@ class GdwTestWidget(QWidget):
             return
         case = self._flow_queue.pop(0)
         self._flow_case = case
+        # 队列里的**每条**用例都要按它自己的需要启虚拟表（此前只在开跑时按「选中的」
+        # 那条判一次，队列后续用例需要 STA 时会漏启动）
+        self._ensure_sta_sim_for_flow()
         self._render_flow_steps(case)
         self._set_flow_result(case.fid, "进行中")
         self._flow_served = 0
+        self._flow_alt_used = {}
+        self._stop_concurrent()
+        self._flow_concurrent_sent = 0
         self._flow_runner = flows.FlowRunner(case, self._flow_overrides)
         self._flow_rx_buffer = []          # 每条用例独立缓存，互不串台
         self._log(f"[信息] 流程开始：{case.name}（{len(case.steps)} 步）", "info")
@@ -2148,6 +2256,7 @@ class GdwTestWidget(QWidget):
         self._flow_queue = []
         self._flow_runner.stop()
         self._flow_timer.stop()
+        self._stop_concurrent()
         self._flow_action = None
         self._log("[信息] 流程已停止", "warn")
         self._render_flow_runner()
@@ -2169,6 +2278,7 @@ class GdwTestWidget(QWidget):
         self._flow_poll_step = None
         self._flow_rx_buffer = []
         self._flow_timer.stop()
+        self._stop_concurrent()
         queued = bool(self._flow_queue)
         if not queued:
             self.btn_flow_start.setEnabled(True)
@@ -2268,6 +2378,25 @@ class GdwTestWidget(QWidget):
             self._log(f"[流程] 等待 {step.timeout:.0f}s：{step.title}", "info")
             self._flow_timer.start(int(max(0.1, step.timeout) * 1000))
             return
+        if action.kind == flows.KIND_SILENCE:
+            allowed = "".join(f"/{a:02X}H F{f}" for a, f in (step.accept or ()))
+            self._log(f"[流程] 静默观察 {step.timeout:.0f}s：{step.title}"
+                      f"（窗口内收到任何{'除 ' + allowed + ' 之外' if allowed else ''}上行即判不合格）",
+                      "info")
+            self._flow_timer.start(int(max(0.1, step.timeout) * 1000))
+            return
+        if action.kind == flows.KIND_EXPECT_STA:
+            svc = self._sta_sim
+            if svc is None or not svc.isRunning():
+                self._log("[失败] 未启动从节点模拟：无法观测 STA 域（CCO 下发给从节点的帧）",
+                          "fail")
+                self._flow_done(False, "未启动从节点模拟，无法观测 STA 域")
+                return
+            flt = dict(step.sta_filter or {})
+            desc = "、".join(f"{k}={v}" for k, v in flt.items()) or "任意 645/698 帧"
+            self._log(f"[流程] 观测 STA 域下行（{step.timeout:.0f}s）：{desc}", "info")
+            self._flow_timer.start(int(max(0.1, step.timeout) * 1000))
+            return
         if action.kind == flows.KIND_RESET_STA:
             self._run_sta_reset(step)
             return
@@ -2319,6 +2448,9 @@ class GdwTestWidget(QWidget):
             self._flow_done(False, f"组帧失败：{exc}")
             return
         sent_any = False
+        if getattr(step, "concurrent", False):
+            self._start_concurrent(step, frames, action.index)
+            return
         for frame, node_addr in frames:
             ok, reason = self._channel.send(frame)
             if not ok:
@@ -2339,14 +2471,65 @@ class GdwTestWidget(QWidget):
         if not sent_any:
             self._flow_done(False, "没有可发送的帧")
             return
-        self._flow_sent = True
         # 不等应答的步骤（如 14H F3 下行回延时修正）：发完立即推进，
         # 被测收到后会自己继续抄表并上报 13H F1，干等只会白超时判失败
         if getattr(step, "no_reply", False):
-            self._log(f"  → 已下发（本步不等应答，直接进入下一步）", "ok")
+            self._log("  → 已下发（本步不等应答，直接进入下一步）", "ok")
             self._flow_done(True, "已下发（不等应答）")
             return
         self._flow_timer.start(int(max(0.2, step.timeout) * 1000))
+
+    def _start_concurrent(self, step, frames: List[Tuple[bytes, str]], index: int) -> None:
+        """并发连发：**逐帧连发、不逐帧等应答**，收到否认即停并记录并发帧数。
+
+        用户口径（2026-11-02）：并发抄表用 `F1H F1`，一次性把 N 个不同地址的抄表帧
+        连发出去触发被测回「超过最大并发数（109）」；**收到否认时已发出的帧数 = 最大并发数**。
+        """
+        self._flow_concurrent_frames = list(frames)
+        self._flow_concurrent_sent = 0
+        self._flow_concurrent_step = step
+        self._log(f"[流程] 并发连发 {len(frames)} 帧（连发不等应答；收到否认即停并记录并发数，"
+                  f"看门狗 {step.timeout:.0f}s）", "info")
+        self._flow_timer.start(int(max(1.0, step.timeout) * 1000))
+        self._flow_concurrent_timer.start(CONCURRENT_SEND_INTERVAL_MS)
+
+    def _send_next_concurrent(self) -> None:
+        """连发下一条；全部发完仍无否认 → 判失败并写明「未测出上限」。"""
+        if self._flow_runner is None or self._flow_concurrent_step is None:
+            self._stop_concurrent()
+            return
+        frames = self._flow_concurrent_frames
+        if self._flow_concurrent_sent >= len(frames):
+            total = self._flow_concurrent_sent
+            self._stop_concurrent()
+            self._flow_done(False, f"连发 {total} 帧均未收到否认：未测出最大并发数"
+                                   f"（被测最大并发数 ≥ {total}，请把地址数调大再测）")
+            return
+        step = self._flow_concurrent_step
+        frame, node_addr = frames[self._flow_concurrent_sent]
+        ok, reason = self._channel.send(frame)
+        if not ok:
+            self._stop_concurrent()
+            self._flow_done(False, f"第 {self._flow_concurrent_sent + 1} 帧发送失败：{reason}")
+            return
+        self._flow_concurrent_sent += 1
+        self.spin_seq.setValue((self.spin_seq.value() + 1) & 0xFF)
+        label = self._with_node(self._cmd_label(step.key), node_addr)
+        self._add_raw_row("TX", frame, label)
+        self._log(f"[TX#{self._flow_concurrent_sent}] {label} ({len(frame)}B) {_fmt(frame)}", "tx")
+        runner = self._flow_runner
+        self._interactions.append({
+            "time": datetime.now().strftime("%H:%M:%S.%f")[:-3],
+            "direction": "TX", "label": self._cmd_label(step.key), "node": node_addr,
+            "result": f"并发第 {self._flow_concurrent_sent} 帧",
+            "reason": f"流程：{runner.case.name if runner is not None else ''}",
+            "frame": core.format_hex(frame),
+        })
+
+    def _stop_concurrent(self) -> None:
+        self._flow_concurrent_timer.stop()
+        self._flow_concurrent_frames = []
+        self._flow_concurrent_step = None
 
     def _run_sta_reset(self, step) -> None:
         """下发 STA 硬件初始化（645 广播），让从节点重新入网并主动上报。
@@ -2714,10 +2897,13 @@ class GdwTestWidget(QWidget):
     def _build_flow_frames(self, step) -> List[Tuple[bytes, str]]:
         """流程发帧：抄表类步骤按从节点协议填报文，并按节点各发一帧。
 
-        - `13H F1`/`14H F1` 等带「报文内容」的命令：报文内容 = 该从节点协议的
+        - `13H F1`/`14H F1`/`F1H F1` 等带「报文内容」的命令：报文内容 = 该从节点协议的
           读正向有功总电能报文（645 → 68…11 04 33 33 34 33 CS 16；698 → GET 00100200），
-          报文长度由生成器自动派生；地址按节点填、协议类型按节点填。
-        - 「按组网参数展开」开启且命令是单节点类 → 每个从节点各发一帧。
+          报文长度按内容长度填；地址按节点填、协议类型按节点填。
+        - **步骤自带地址列（`FlowStep.addrs`）**：按 `batch` 分组、每组一帧，
+          列表字段（`从节点列表`）按组填行 —— 建档铺 100 个地址、并发抄表逐地址连发都走它，
+          **与「组网参数」的 1~2 个节点无关**。
+        - 否则：「按组网参数展开」开启且命令是单节点类 / `split_nodes` → 每个从节点各发一帧。
         """
         cmd = self._find_cmd(step.key)
         if cmd is None:
@@ -2728,12 +2914,20 @@ class GdwTestWidget(QWidget):
                       "修正通信数据内容" if "修正通信数据内容" in field_names else "")
         net = self._collect_network()
         nodes = net.active_slaves()
+        step_addrs = tuple(str(a) for a in (getattr(step, "addrs", ()) or ()))
+
+        if step_addrs:
+            return self._build_addrs_frames(step, cmd, needs_request, data_field, nodes)
 
         targets = [None]
         if nodes and needs_request:
             # 抄表类：一份报文只能对应一块表 → 每个从节点各发一帧（无论是否列表型命令）
             targets = list(nodes)
         elif nodes and net.fanout and net_mod.is_node_scoped(cmd):
+            targets = list(nodes)
+        if getattr(step, "split_nodes", False) and nodes:
+            # 分帧下发（11H F1 添加从节点）：文档要求逐个从节点各下一帧，
+            # 而不是一帧塞两个地址 —— 与「按组网参数自动填充」开关无关
             targets = list(nodes)
 
         frames: List[Tuple[bytes, str]] = []
@@ -2743,6 +2937,10 @@ class GdwTestWidget(QWidget):
             runner = self._flow_runner
             if runner is not None:
                 values.update(runner.values_for(step))
+            if getattr(step, "split_nodes", False) and node is not None:
+                # 只放这一个节点；「从节点数量」由生成器按列表长度自动回填
+                values["从节点列表"] = [{"从节点地址": node.addr,
+                                         "通信协议类型": int(node.proto)}]
             if needs_request:
                 import gdw_meter_request as req
 
@@ -2789,6 +2987,67 @@ class GdwTestWidget(QWidget):
             frames.append((frame, node.addr if node is not None else ""))
         return frames
 
+    def _build_addrs_frames(self, step, cmd, needs_request: bool,
+                            data_field: str, nodes) -> List[Tuple[bytes, str]]:
+        """按 `FlowStep.addrs` 组帧（**与组网参数的 1~2 个节点无关**）。
+
+        两种命令形态：
+
+        - **数据单元里带列表**（`11H F1 添加从节点`：`从节点列表` 字段）→ 按 `batch`
+          分组，每组一帧、列表里放该组的全部地址；
+        - **一帧一块表**（`F1H F1 集中器主动并发抄表`，表 135）→ 每个地址一帧，
+          **表地址填进 376.2 的「目的地址(A3)」**，数据单元只有
+          `规约类型 + 保留 + 报文长度(2B) + 报文内容`。
+
+        协议类型取组网参数里第一个从节点的协议（没有就用 645-2007），全部地址统一。
+        """
+        import gdw_meter_request as req
+
+        proto = int(nodes[0].proto) if nodes else net_mod.PROTO_645_2007
+        addr_list = [str(a) for a in (getattr(step, "addrs", ()) or ())]
+        has_list = any(str(f.get("name")) == "从节点列表" for f in (cmd.fields or ()))
+        each = max(1, int(getattr(step, "batch", 0) or 1)) if has_list else 1
+        groups = [addr_list[i:i + each] for i in range(0, len(addr_list), each)]
+
+        src = self.edit_src.text().strip()
+        default_dst = self.edit_dst.text().strip()
+        frames: List[Tuple[bytes, str]] = []
+        for group in groups:
+            values = dict(self._values_for(core.PAGE_READ, step.key, group[0]))
+            runner = self._flow_runner
+            if runner is not None:
+                values.update(runner.values_for(step))
+            if has_list:
+                rows: List[Dict[str, Any]] = []
+                for addr in group:
+                    row: Dict[str, Any] = {"从节点地址": addr, "通信协议类型": proto}
+                    if data_field == "报文内容":
+                        payload = req.read_request_for(proto, addr)
+                        row["报文长度"] = len(payload)
+                        row["报文内容"] = payload.hex().upper()
+                    elif data_field:
+                        row[data_field] = ""
+                    rows.append(row)
+                values["从节点列表"] = rows
+            else:
+                # 一帧一块表：报文内容按该地址的协议生成，表地址走「目的地址」
+                values["规约类型"] = proto
+                if data_field == "报文内容":
+                    payload = req.read_request_for(proto, group[0])
+                    values["报文内容"] = payload.hex().upper()
+                elif data_field:
+                    values[data_field] = ""
+            raw_text = (self._raw_for(core.PAGE_READ, step.key).strip()
+                        or self._raw_for(core.PAGE_WRITE, step.key).strip())
+            raw = _parse_hex(raw_text) if raw_text else b""
+            frame = core.build_frame(
+                cmd, values, src=src,
+                dst=(group[0] if not has_list else default_dst),
+                relay=self._relay_addrs(), info=self._info_config(), raw_data=raw,
+            )
+            frames.append((frame, group[0] if len(group) == 1 else ""))
+        return frames
+
     def _build_flow_frame(self, step) -> bytes:
         values = {}
         runner = self._flow_runner
@@ -2814,6 +3073,7 @@ class GdwTestWidget(QWidget):
         if self._flow_runner is None:
             return
         self._flow_timer.stop()
+        self._stop_concurrent()
         action = self._flow_runner.advance(ok, note)
         self._render_flow_runner()
         self._run_flow_action(action)
@@ -2829,6 +3089,14 @@ class GdwTestWidget(QWidget):
         if self._flow_action.kind == "sleep":
             self._flow_done(True, "等待结束")
             return
+        if self._flow_action.kind == "silence":
+            # 静默窗口整段没收到任何上行 ⇒ 这才是 T2 静默合规
+            self._flow_done(True, f"{step.timeout:.0f}s 内未收到任何上行（静默通过）")
+            return
+        if self._flow_action.kind == "expect_sta":
+            self._flow_done(False, f"窗口内未在 STA 域观测到期望的 645/698 帧"
+                                   f"（{step.timeout:.0f}s）")
+            return
         if self._flow_action.kind == "manual":
             self._flow_done(False, "未人工确认（按跳过处理）")
             return
@@ -2842,9 +3110,15 @@ class GdwTestWidget(QWidget):
             else:
                 self._flow_done(False, "窗口内没有收到 14H F1 请求抄读内容")
             return
+        if step is not None and self._flow_try_alt(step):
+            return
         kind = "wait" if self._flow_action.kind == "wait" else "send"
         self._log(f"[流程] 超时（{kind}）：{step.title if step else ''}", "warn")
-        self._flow_done(step.optional if step else False, "超时")
+        note = "超时"
+        if step is not None and getattr(step, "concurrent", False):
+            note = (f"超时：已连发 {self._flow_concurrent_sent} 帧仍未收到否认"
+                    f"（未测出最大并发数）")
+        self._flow_done(step.optional if step else False, note)
 
     def _flow_on_frame(self, frame: bytes) -> bool:
         """流程执行期间的收帧处理；返回 True 表示已被流程消费。"""
@@ -2868,6 +3142,17 @@ class GdwTestWidget(QWidget):
         # 等下发 14H F3 下行时按它回送（而不是自己新造一帧）
         if afn == 0x14 and fn == 3:
             self._capture_delay_request(info)
+        if action.kind == "silence":
+            step = action.step
+            import gdw_test_flows as flows
+
+            if flows.step_accepts(step, afn, fn):
+                # accept 里显式声明的上行（如链路保活）不算违规，但要留痕
+                self._log(f"  → 静默窗口内收到已声明允许的 {afn:02X}H F{fn}（不判违规）", "warn")
+                return True
+            self._flow_done(False, f"T2 静默窗口内收到 {afn:02X}H F{fn}"
+                                   f"（协议要求静默期内不得有任何报文）")
+            return True
         if action.kind == "serve":
             # 服务步：收到 until 指定的上行（06H F2 抄读数据）即完成并做数据校验
             step = action.step
@@ -2877,7 +3162,8 @@ class GdwTestWidget(QWidget):
                     import gdw_test_flows as flows
 
                     ok, note = flows.run_check(check_name, rows, (),
-                                               self._sta_recent_responses())
+                                               self._sta_recent_responses(),
+                                               context=self._flow_check_context(step))
                     self._log(f"  → 数据判定：{note}", "ok" if ok else "fail")
                     self._flow_done(ok, note or f"已服务 {self._flow_served} 次路由请求")
                     return True
@@ -2898,7 +3184,8 @@ class GdwTestWidget(QWidget):
             self._log(f"  → 流程第 {action.index + 1} 步：收到期望上行", "ok")
             check_name = getattr(step, "check", "") or ""
             if check_name:
-                ok, note = flows.run_check(check_name, rows, (), self._sta_recent_responses())
+                ok, note = flows.run_check(check_name, rows, (), self._sta_recent_responses(),
+                                           context=self._flow_check_context(step))
                 self._log(f"  → 数据判定：{note}", "ok" if ok else "fail")
                 self._flow_done(ok, note)
                 return True
@@ -2909,6 +3196,15 @@ class GdwTestWidget(QWidget):
             cmd = self._find_cmd(step.key)
             verdict = expect_mod.judge(cmd, frame) if cmd is not None else {}
             code = verdict.get("verdict")
+            want_denial = getattr(step, "expect_denial", None)
+            if getattr(step, "concurrent", False):
+                handled, done = self._flow_judge_concurrent(step, verdict, code)
+                if handled:
+                    return done
+            elif want_denial is not None:
+                handled, done = self._flow_judge_denial(step, verdict, code)
+                if handled:
+                    return done
             if code in (expect_mod.V_DENY_FAIL, expect_mod.V_UNSUPPORTED, expect_mod.V_BAD):
                 if action.kind == "poll" and self._flow_poll_step is not None:
                     # 轮询期间的否认/坏帧不立即判失败，等窗口内重试
@@ -2927,7 +3223,8 @@ class GdwTestWidget(QWidget):
                 if check_name:
                     archive = flows.default_archive_addrs(self._collect_network())
                     ok, detail = flows.run_check(check_name, rows, archive,
-                                                 self._sta_recent_responses())
+                                                 self._sta_recent_responses(),
+                                                 context=self._flow_check_context(step))
                     note = detail or note
                 if action.kind == "poll" and self._flow_poll_step is not None:
                     if ok:
@@ -2939,6 +3236,122 @@ class GdwTestWidget(QWidget):
                 return True
             return False
         return False
+
+    def _flow_judge_concurrent(self, step, verdict: Dict[str, Any], code: Any
+                               ) -> Tuple[bool, bool]:
+        """并发连发的应答判定：**收到否认即停**，已发帧数 = 被测的最大并发数。
+
+        返回 ``(是否已处理, 是否消费该帧)``：
+
+        - 否认 → 停发并收尾（预期码 109 = 超过最大并发数 → 通过；其它码 → 失败并点名）；
+        - 确认/同命令数据 → 该帧被受理，**继续连发**（不推进步骤）；
+        - 其它（无关帧/坏帧）→ 交回通用分派。
+        """
+        if code in (expect_mod.V_DENY_FAIL, expect_mod.V_UNSUPPORTED):
+            self._stop_concurrent()
+            got = verdict.get("error_code")
+            try:
+                got_int: Optional[int] = int(got) if got is not None else None
+            except (TypeError, ValueError):
+                got_int = None
+            sent = max(1, self._flow_concurrent_sent)
+            codes = self._denial_codes(step.expect_denial) or [109]
+            if got_int is not None and got_int in codes:
+                self._flow_done(True, f"最大并发数 = {sent}（第 {sent} 帧被否认："
+                                       f"{expect_mod.error_status_text(got_int)}）")
+            else:
+                self._flow_done(False, f"第 {sent} 帧被否认，但错误码 "
+                                       f"{got_int if got_int is not None else '?'} 不是预期的 "
+                                       f"{'/'.join(str(c) for c in codes)}："
+                                       f"{verdict.get('reason')}")
+            return True, True
+        if code in (expect_mod.V_CONFIRM, expect_mod.V_DATA, expect_mod.V_WAITING):
+            return True, True          # 该帧被受理，继续连发
+        return False, False
+
+    def _flow_judge_denial(self, step, verdict: Dict[str, Any], code: Any
+                           ) -> Tuple[bool, bool]:
+        """``expect_denial`` 判定（负面用例）：返回 ``(是否已处理, 是否消费该帧)``。
+
+        预期否认码可以是 int 或 int 序列（同一非法帧在不同固件上可能回
+        「1 无效数据单元」或「2 长度错」）。
+        """
+        codes = self._denial_codes(step.expect_denial)
+        if code in (expect_mod.V_DENY_FAIL, expect_mod.V_UNSUPPORTED):
+            got = verdict.get("error_code")
+            try:
+                got_int: Optional[int] = int(got) if got is not None else None
+            except (TypeError, ValueError):
+                got_int = None
+            if got_int is not None and got_int in codes:
+                self._flow_done(True, f"收到预期否认（错误状态字={got_int}）")
+                return True, True
+            self._flow_done(False, f"否认码 {got if got is not None else '?'}"
+                                   f" ≠ 预期 {'/'.join(str(c) for c in codes)}")
+            return True, True
+        if code in (expect_mod.V_CONFIRM, expect_mod.V_DATA, expect_mod.V_WAITING):
+            self._flow_done(False, "预期否认（错误状态字 "
+                                   f"{'/'.join(str(c) for c in codes)}），但设备回了"
+                                   f"「{verdict.get('reason') or '确认/数据'}」"
+                                   " → 非法帧被受理，判不合格")
+            return True, True
+        # 其它帧（与当前命令无关）继续等
+        return False, False
+
+    @staticmethod
+    def _denial_codes(value: Any) -> List[int]:
+        """``expect_denial`` → 码列表（单 int / 序列 / 非法一律回落空表）。"""
+        if value is None:
+            return []
+        items = value if isinstance(value, (list, tuple, set)) else [value]
+        out: List[int] = []
+        for item in items:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def _flow_check_context(self, step=None) -> Dict[str, Any]:
+        """`run_check` 需要的组网上下文（CCO 地址 / 载波频段 / 从节点地址）。"""
+        import gdw_test_flows as flows
+
+        net = self._collect_network()
+        band = int(net.carrier_band)
+        if step is not None:
+            raw = (getattr(step, "values", None) or {}).get(net_mod.FIELD_BAND)
+            if raw is None:
+                # 回读类步骤（03H F16）自己没有频段字段：取「设置命令」当前生效值
+                raw = self._values_for(core.PAGE_WRITE, "05-16", "").get(net_mod.FIELD_BAND)
+            try:
+                if raw not in (None, ""):
+                    band = int(raw)
+            except (TypeError, ValueError):
+                band = int(net.carrier_band)
+        return {
+            "cco_addr": net.cco_addr,
+            "band": band,
+            "slave_addrs": flows.default_archive_addrs(net),
+        }
+
+    def _flow_try_alt(self, step) -> bool:
+        """本步失败后按 ``alt_keys`` 换命令重试；返回 True 表示已改试（不判失败）。"""
+        import gdw_test_flows as flows
+
+        action = self._flow_action
+        used = self._flow_alt_used.get(action.index, 0)
+        alt_keys = tuple(getattr(step, "alt_keys", ()) or ())
+        if used >= len(alt_keys):
+            return False
+        key = alt_keys[used]
+        self._flow_alt_used[action.index] = used + 1
+        alt = replace(step, key=key, title=f"{step.title}（改用 {self._cmd_label(key)}）")
+        self._log(f"[流程] {self._cmd_label(step.key)} 未成功 → 自动改试 "
+                  f"{self._cmd_label(key)}", "warn")
+        if self._flow_runner is not None:
+            self._flow_runner.states[action.index] = flows.STEP_RUNNING
+        self._run_flow_action(flows.Action(step.kind, alt, action.index))
+        return True
 
     def _on_send(self) -> None:
         if self._awaiting or self._next_timer.isActive():
@@ -3754,6 +4167,7 @@ class GdwTestWidget(QWidget):
         self._timeout_timer.stop()
         self._next_timer.stop()
         self._flow_timer.stop()
+        self._stop_concurrent()          # 并发连发的逐帧定时器也要停，否则关窗后仍在发帧
         self._awaiting = False
         self._persist_current_params()
         self._save_persisted()

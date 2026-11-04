@@ -115,17 +115,18 @@ def test_runner():
     check("说明带原因", runner2.notes[1], "否认（表号重复）")
     check("失败后用例整体判失败", runner2.failed, True)
 
-    # 可选步失败不影响结论（识别流程的 03H F10 主动查询是 optional）
-    ident = F.flow_case("identify")
-    opt_idx = next(i for i, s in enumerate(ident.steps) if s.optional)
-    r3 = F.FlowRunner(ident)
+    # 可选步失败不影响结论（识别流程已无可选步：03H F10 主动查询已改为必需，
+    # 故这里用内联构造的用例验证 optional 语义本身）
+    opt_case = F.FlowCase("tmp", "临时", "", [
+        F.FlowStep(F.KIND_SEND, "可选步", key="03-4", optional=True, timeout=1.0),
+        F.FlowStep(F.KIND_SEND, "后续步", key="10-1", timeout=1.0),
+    ])
+    r3 = F.FlowRunner(opt_case)
     action = r3.start()
-    while action.index < opt_idx:
-        check_true(f"推进到可选步前：{action.step.title[:16]}", action.index < opt_idx, action.index)
-        action = r3.advance(True)
+    check("首步是可选步", (action.index, action.step.optional), (0, True))
     action = r3.advance(False, "超时")   # 可选步失败
-    check("可选步失败记为跳过", (r3.states[opt_idx], r3.failed), (F.STEP_SKIP, False))
-    check("可选步后仍在推进", action.kind != "done", True)
+    check("可选步失败记为跳过", (r3.states[0], r3.failed), (F.STEP_SKIP, False))
+    check("可选步后仍在推进", (action.kind, action.index), (F.KIND_SEND, 1))
 
     # 停止
     r4 = F.FlowRunner(F.flow_case("register"))
@@ -589,7 +590,8 @@ def test_page():
     app.processEvents()
     labels = [w.page_tabs.tabText(i) for i in range(w.page_tabs.count())]
     check("页签在「自定义」右边", labels[-2:], ["自定义", "流程测试"])
-    check("流程页叶子数 = 用例数", C.leaf_count(C.PAGE_FLOW), len(F.FLOW_CASES))
+    check("流程页叶子数 = 全部用例数（内置 + 文档补充 + 自定义）",
+          C.leaf_count(C.PAGE_FLOW), len(F.all_cases()))
 
     w._select_page(C.PAGE_FLOW, notify=True)
     app.processEvents()
@@ -1186,6 +1188,505 @@ def test_delay_correct():
     w.close()
 
 
+# ══════════════════════════════════════════════════════════════════════
+# [24]~[30] 判定加严 / 新判定 / STA 观测 / 静默 / 预期否认 / 备用命令 / 分帧并发
+# ══════════════════════════════════════════════════════════════════════
+class _FakeChannel:
+    """流程测试用的假通道（只记录发了什么，永远「发送成功」）。"""
+
+    def __init__(self):
+        self.sent = []
+        self.paused = 0
+
+    def ready(self):
+        return True
+
+    def state_text(self):
+        return "fake"
+
+    def send(self, frame):
+        self.sent.append(bytes(frame))
+        return True, ""
+
+    def abort(self):
+        self.paused += 1
+
+    def cleanup(self):
+        pass
+
+    def rebind_bluetooth(self):
+        pass
+
+
+def _up_frame(afn, dt1, dt2, data=b"", seq=0x11):
+    """手搓 376.2 上行帧：控制域 83H + 6B 信息域 + AFN + DT + 数据 + CS + 16。"""
+    payload = bytes([0x83]) + b"\x00" * 5 + bytes([seq]) + bytes([afn, dt1, dt2]) + bytes(data)
+    total = len(payload) + 5
+    return bytes([0x68, total & 0xFF, 0]) + payload + bytes([sum(payload) & 0xFF, 0x16])
+
+
+def _make_widget():
+    app = QApplication.instance() or QApplication([])
+    w = W.GdwTestWidget()
+    w._channel = _FakeChannel()
+    w.node_widgets[0]["addr"].setText("0000000033")
+    w.node_widgets[0]["proto"].setCurrentIndex(
+        max(0, w.node_widgets[0]["proto"].findData(2)))          # 645-2007
+    w.node_widgets[1]["addr"].setText("000006881225")
+    w.node_widgets[1]["proto"].setCurrentIndex(
+        max(0, w.node_widgets[1]["proto"].findData(3)))          # 698.45
+    w._on_network_edited()
+    app.processEvents()
+    return app, w
+
+
+def test_tightened_cases():
+    section("[24] 内置用例判定加严（假通过的口子都堵上）")
+    ident = F.flow_case("identify")
+    step_10 = next(s for s in ident.steps if s.key == "03-10")
+    check("03H F10 主动查询不再是可选项", step_10.optional, False)
+    check_true("提示写明「无应答即判不合格」", "不合格" in step_10.hint, step_10.hint)
+    step_4 = next(s for s in ident.steps if s.key == "03-4")
+    check("03H F4 带主节点地址判定", step_4.check, F.CHECK_MASTER_ADDR)
+
+    check("参数区初始化有备用命令 11H F2", F._init_params().alt_keys, ("11-2",))
+    check_true("初始化提示写明会自动改试", "删除从节点" in F._init_params().hint,
+               F._init_params().hint)
+    check("建档按节点分帧下发", F._add_nodes().split_nodes, True)
+
+    for fid in ("archive",):
+        step = next(s for s in F.flow_case(fid).steps if s.key == "10-1")
+        check(f"{fid} 的 10H F1 校验数量", step.check, F.CHECK_NODE_COUNT)
+    pre = F.prerequisite_steps()
+    check("前置的 10H F1 也校验数量",
+          next(s for s in pre if s.key == "10-1").check, F.CHECK_NODE_COUNT)
+
+    bc = F.flow_case("broadcast")
+    silence = [s for s in bc.steps if s.kind == F.KIND_SILENCE]
+    check("广播流程用静默窗口（不再固定 sleep）", len(silence), 1)
+    check("静默步超时 = T2 观察时长", silence[0].timeout, 5.0)
+    check("广播流程不再有纯 sleep 步", [s.kind for s in bc.steps if s.kind == F.KIND_SLEEP], [])
+    # 步数未变（改的是判定，不是流程结构）
+    check("广播流程仍是 5 步", len(bc.steps), 5)
+
+
+def test_new_checks():
+    section("[25] 新判定函数（主节点地址 / 节点数量 / 频段 / 频段回读）")
+    master_rows = [("  主节点地址", "00 00 00 00 00 33", "000000000033", "BCD编码，6字节", 0, 5)]
+    ok, note = F.run_check(F.CHECK_MASTER_ADDR, master_rows,
+                           context={"cco_addr": "000000000033"})
+    check("主节点地址与终端地址相同 → 失败", ok, False)
+    check_true("说明点出「一致」与文档依据", ("相同" in note) and ("113" in note), note)
+    ok, note = F.run_check(F.CHECK_MASTER_ADDR, master_rows,
+                           context={"cco_addr": "000000000099"})
+    check_true("主节点地址 ≠ 终端地址 → 通过", ok, note)
+    ok, note = F.run_check(F.CHECK_MASTER_ADDR, master_rows)
+    check("组网参数未填 CCO → 无法判定", ok, False)
+    check_true("说明讲清缺什么", "CCO 地址" in note, note)
+    check("没有主节点地址字段 → 失败", F.run_check(F.CHECK_MASTER_ADDR, [])[0], False)
+
+    count_rows = [("  从节点总数量", "0x0200", "2", "", 0, 1)]
+    ok, note = F.run_check(F.CHECK_NODE_COUNT, count_rows, ["000000000033", "000006881225"])
+    check_true("数量与组网一致 → 通过", ok, note)
+    ok, note = F.run_check(F.CHECK_NODE_COUNT, count_rows, ["000000000033"])
+    check("数量与组网不一致 → 失败", ok, False)
+    check("组网没填从节点 → 无法比对", F.run_check(F.CHECK_NODE_COUNT, count_rows, [])[0], False)
+
+    band_rows = [("  宽带载波频段", "0x02", "2", "0.781~2.930MHz", 0, 0)]
+    ok, note = F.run_check(F.CHECK_BAND, band_rows)
+    check_true("频段 2 合法 → 通过", ok, note)
+    check_true("说明附频率范围", "MHz" in note, note)
+    check("频段 9 越界 → 失败",
+          F.run_check(F.CHECK_BAND, [("  宽带载波频段", "0x09", "9", "保留", 0, 0)])[0], False)
+    ok, note = F.run_check(F.CHECK_BAND_ECHO, band_rows, context={"band": 2})
+    check_true("回读频段 == 设置值 → 通过", ok, note)
+    check("回读频段 ≠ 设置值 → 失败",
+          F.run_check(F.CHECK_BAND_ECHO, band_rows, context={"band": 1})[0], False)
+    check("没有设置值 → 无法比对",
+          F.run_check(F.CHECK_BAND_ECHO, band_rows)[0], False)
+
+
+def test_match_sta_frame():
+    section("[26] STA 域帧匹配（645 控制码/DI 与 698 APDU）")
+    read645 = C.parse_hex("68 33 00 00 00 00 00 68 11 04 33 33 34 33 E5 16")
+    s_ok = F.FlowStep(F.KIND_EXPECT_STA, "x",
+                      sta_filter={"域": "645", "控制码": 0x11, "DI": "0001"})
+    ok, desc = F.match_sta_frame(s_ok, read645)
+    check_true("645 控制码 11H + DI 0001 → 命中", ok, desc)
+    check_true("说明给出还原后的 DI（去 0x33 加扰）", "00010000" in desc, desc)
+    s_bad = F.FlowStep(F.KIND_EXPECT_STA, "x",
+                       sta_filter={"域": "645", "控制码": 0x11, "DI": "0301"})
+    check("DI 前缀不符 → 不命中", F.match_sta_frame(s_bad, read645)[0], False)
+    s_ctrl = F.FlowStep(F.KIND_EXPECT_STA, "x", sta_filter={"域": "645", "控制码": 0x14})
+    check("控制码不符 → 不命中", F.match_sta_frame(s_ctrl, read645)[0], False)
+    check("域=645 但给的是 698 帧 → 不命中",
+          F.match_sta_frame(s_ok, C.parse_hex(
+              "68 17 00 43 05 33 00 00 00 00 00 00 C7 52 05 01 01 00 10 02 00 00 92 2E 16"))[0],
+          False)
+
+    # 复位主动上报状态字：14H 写数据，DI 04001503 → 线上 36 48 33 37
+    reset = bytes.fromhex("68" + "330000000000" + "68" + "14" + "04" + "36483337" + "AA" + "16")
+    s_reset = F.FlowStep(F.KIND_EXPECT_STA, "x",
+                         sta_filter={"域": "645", "控制码": 0x14, "DI": "04001503"})
+    ok, desc = F.match_sta_frame(s_reset, reset)
+    check_true("645 写 04001503 → 命中", ok, desc)
+    check_true("说明里 DI 是书写序", "04001503" in desc, desc)
+
+    # 698：REPORT-Response（APDU 0x88）
+    resp698 = C.parse_hex("68 17 00 43 05 33 00 00 00 00 00 00 C7 52 88 01 01 00 10 02 00 00 92 2E 16")
+    s_698 = F.FlowStep(F.KIND_EXPECT_STA, "x", sta_filter={"域": "698", "APDU": 0x88})
+    ok, desc = F.match_sta_frame(s_698, resp698)
+    check_true("698 APDU 0x88 → 命中", ok, desc)
+    check("698 期望 0x85 → 不命中",
+          F.match_sta_frame(
+              F.FlowStep(F.KIND_EXPECT_STA, "x",
+                         sta_filter={"域": "698", "APDU": 0x85}), resp698)[0], False)
+    check("域=698 但给的是 645 帧 → 不命中",
+          F.match_sta_frame(s_698, read645)[0], False)
+    check("空帧 → 不命中", F.match_sta_frame(s_698, b"")[0], False)
+
+
+def test_silence_window():
+    section("[27] 静默窗口：收到任何未声明上行即判不合格")
+    app, w = _make_widget()
+    case = F.flow_case("broadcast")
+    runner = F.FlowRunner(case)
+    w._flow_runner = runner
+    action = runner.start()
+    while action.kind not in (F.KIND_SILENCE, "done"):
+        action = runner.advance(True)
+    check("推进到静默步", action.kind, F.KIND_SILENCE)
+    w._flow_action = action
+    idx = action.index
+    # ① 窗口内收到 03H F10 上行 → 该步直接判不合格
+    w._flow_on_frame(_up_frame(0x03, 0x02, 0x01, bytes.fromhex("0100")))
+    app.processEvents()
+    check("静默期内收到上行 → 该步失败", runner.states[idx], F.STEP_FAIL)
+    check_true("说明点名收到的 AFN/Fn",
+               "静默窗口内收到 03H F10" in (runner.notes[idx] or ""), runner.notes[idx])
+    check("整条用例判失败", runner.failed, True)
+    w._flow_runner = None
+    w._flow_timer.stop()
+
+    # ② 窗口内什么都没收到 → 超时即「静默通过」
+    runner2 = F.FlowRunner(case)
+    w._flow_runner = runner2
+    action = runner2.start()
+    while action.kind not in (F.KIND_SILENCE, "done"):
+        action = runner2.advance(True)
+    w._flow_action = action
+    idx2 = action.index
+    w._on_flow_timeout()
+    app.processEvents()
+    check("静默期内无上行 → 该步通过", runner2.states[idx2], F.STEP_OK)
+    check_true("说明写明静默通过", "静默通过" in (runner2.notes[idx2] or ""),
+               runner2.notes[idx2])
+    w._flow_runner = None
+    w._flow_timer.stop()
+    w.close()
+
+
+def test_expect_denial():
+    section("[28] 预期否认：负面用例只在否认码对得上时才算通过")
+    app, w = _make_widget()
+
+    def run_one(frame):
+        case = F.FlowCase("tmp_deny", "临时", "", [
+            F.FlowStep(F.KIND_SEND, "重复建档", key="11-1", expect_denial=6, timeout=1.0),
+        ])
+        runner = F.FlowRunner(case)
+        w._flow_runner = runner
+        w._flow_action = runner.start()
+        w._flow_on_frame(frame)
+        app.processEvents()
+        w._flow_runner = None
+        w._flow_timer.stop()
+        return runner.states[0], runner.notes[0]
+
+    state, note = run_one(_up_frame(0x00, 0x02, 0x00, bytes([6])))
+    check("否认码 6（表号重复）→ 通过", state, F.STEP_OK)
+    check_true("说明写明是预期否认", "预期否认" in (note or ""), note)
+
+    state, note = run_one(_up_frame(0x00, 0x02, 0x00, bytes([7])))
+    check("否认码 7 ≠ 预期 6 → 失败", state, F.STEP_FAIL)
+    check_true("说明点出实际码与预期", ("7" in (note or "")) and ("6" in (note or "")), note)
+
+    state, note = run_one(_up_frame(0x00, 0x01, 0x00))
+    check("回确认而非否认 → 失败", state, F.STEP_FAIL)
+    check_true("说明写明「非法帧被受理」", "预期否认" in (note or ""), note)
+
+    # 序列形式：1（无效数据单元）/ 2（长度错）任一都算预期
+    case = F.FlowCase("tmp_deny2", "临时2", "", [
+        F.FlowStep(F.KIND_SEND, "节点数量=0", key="10-104", expect_denial=(1, 2), timeout=1.0),
+    ])
+    runner = F.FlowRunner(case)
+    w._flow_runner = runner
+    w._flow_action = runner.start()
+    w._flow_on_frame(_up_frame(0x00, 0x02, 0x00, bytes([1])))
+    app.processEvents()
+    check("序列预期否认（1 或 2）命中 1 → 通过", runner.states[0], F.STEP_OK)
+    w._flow_runner = None
+    w._flow_timer.stop()
+    w.close()
+
+
+def test_alt_keys():
+    section("[29] 备用命令：初始化被拒时自动改试 11H F2 删除从节点")
+    app, w = _make_widget()
+    step = F.FlowStep(F.KIND_SEND, "参数区初始化", key="01-2", timeout=1.0,
+                      alt_keys=("11-2",))
+    case = F.FlowCase("tmp_alt", "临时", "", [
+        step,
+        F.FlowStep(F.KIND_WAIT, "尾部等待（避免收尾）", afn=0x03, fn=10, timeout=1.0),
+    ])
+    runner = F.FlowRunner(case)
+    w._flow_runner = runner
+    w._flow_action = runner.start()
+    w._run_flow_action(w._flow_action)
+    app.processEvents()
+    check("先发主命令 01H F2", len(w._channel.sent), 1)
+    check("主命令是 01H F2",
+          int({r[0].strip(): r for r in C.parse_table(w._channel.sent[0])}
+              ["应用功能码(AFN)"][2]), 0x01)
+
+    w._on_flow_timeout()          # 超时 → 改试备用命令
+    app.processEvents()
+    check("改试后共发 2 帧", len(w._channel.sent), 2)
+    rows = {r[0].strip(): r for r in C.parse_table(w._channel.sent[1])}
+    check("备用命令是 11H", int(rows["应用功能码(AFN)"][2]), 0x11)
+    check("备用命令是 F2（删除从节点）", rows["数据单元标识(DT)"][3], "F2=删除从节点")
+    check("步骤仍在执行中（不判失败）", runner.states[0], F.STEP_RUNNING)
+    check_true("日志写明自动改试", "自动改试" in w.log_text.toPlainText(),
+               w.log_text.toPlainText()[-300:])
+    w._flow_runner = None
+    w._flow_timer.stop()
+    # 备用命令也用尽后仍然超时 → 正常判失败
+    runner2 = F.FlowRunner(case)
+    w._flow_runner = runner2
+    w._flow_action = runner2.start()
+    w._run_flow_action(w._flow_action)
+    w._on_flow_timeout()
+    w._on_flow_timeout()
+    app.processEvents()
+    check("备用命令也超时 → 判失败", runner2.states[0], F.STEP_FAIL)
+    w._flow_runner = None
+    w._flow_timer.stop()
+    w.close()
+
+
+def test_split_and_addrs():
+    section("[30] 按节点分帧（11H F1）/ 自备地址列建档 / 并发连发测最大并发数（F1H F1）")
+    app, w = _make_widget()
+
+    # ① 分帧：两个从节点 → 两帧，每帧只带 1 个节点
+    step = F.FlowStep(F.KIND_SEND, "添加从节点档案", key="11-1", split_nodes=True)
+    frames = w._build_flow_frames(step)
+    check("分帧下发 = 每节点一帧", len(frames), 2)
+    for idx, (frame, node_addr) in enumerate(frames):
+        rows = {r[0].strip(): r for r in C.parse_table(frame)}
+        check(f"第 {idx+1} 帧只带 1 个节点", rows["从节点数量"][2], "1")
+        wire = C.format_hex(frame)
+        check_true(f"第 {idx+1} 帧地址是 {node_addr}（低字节在前）",
+                   node_addr[:2] + " " in wire or node_addr[-2:] in wire, wire[:80])
+
+    # ② 自备地址列建档：100 个地址、10 个一批 → 10 帧，每帧 10 个地址
+    addrs = F.default_addrs(F.CONCURRENT_NODES)
+    check("默认地址列 = 000000000001~000000000100",
+          (len(addrs), addrs[0], addrs[-1]),
+          (100, "000000000001", "000000000100"))
+    add_step = F.FlowStep(F.KIND_SEND, "批量建档", key="11-1", timeout=20.0,
+                          addrs=addrs, batch=10)
+    add_frames = w._build_flow_frames(add_step)
+    check("建档 10 个一批 = 10 帧", len(add_frames), 10)
+    rows0 = {r[0].strip(): r for r in C.parse_table(add_frames[0][0])}
+    check("每帧 10 个地址", rows0["从节点数量"][2], "10")
+    check_true("首帧第一个地址是 000000000001",
+               "01 00 00 00 00 00" in rows0.get("从节点1地址", ("", "", ""))[1]
+               or "000000000001" in str(rows0.get("从节点1地址", "")), rows0.get("从节点1地址"))
+
+    # ③ 并发连发用 F1H F1（用户口径：并发抄表不是 13H F1）：一帧一块表（表 135），
+    #    表地址走「目的地址(A3)」，数据单元只有 规约类型+保留+报文长度(2B)+报文内容
+    conc_step = F.FlowStep(F.KIND_SEND, "并发连发", key="F1-1", timeout=30.0,
+                           addrs=addrs, batch=1, concurrent=True, expect_denial=109)
+    conc_frames = w._build_flow_frames(conc_step)
+    check("并发连发帧数 = 地址数", len(conc_frames), 100)
+    first = {r[0].strip(): r for r in C.parse_table(conc_frames[0][0])}
+    check("帧是 F1H F1", int(first["应用功能码(AFN)"][2]), 0xF1)
+    check("第 1 帧目的地址 = 第 1 个表地址", first["目的地址(A3)"][2], addrs[0])
+    check("规约类型 = 2（645-2007）", first["规约类型"][2], "2")
+    check("数据单元里没有地址列表（一帧一块表）",
+          [k for k in first if "从节点" in k], [])
+    check_true("帧里带该地址的读报文（645 正向有功总电能）",
+               "68" in first.get("报文内容", ("", "", ""))[1].upper(),
+               first.get("报文内容"))
+    payload_len = len(bytes.fromhex(first["报文内容"][1].replace(" ", "")))
+    check("报文长度 = 报文内容字节数", first["报文内容"][2], f"{payload_len}字节")
+    unit = bytes.fromhex(first["数据单元"][1].replace(" ", ""))
+    check("数据单元 = 规约类型+保留+长度(2B)+报文", len(unit), 4 + payload_len)
+    check("报文长度字段是 2 字节小端（表 135）", unit[2] | (unit[3] << 8), payload_len)
+    second = {r[0].strip(): r for r in C.parse_table(conc_frames[1][0])}
+    check("第 2 帧目的地址换成第 2 个表地址", second["目的地址(A3)"][2], addrs[1])
+
+    # ④ 连发不等应答：逐帧发，收到否认即停，帧数 = 最大并发数
+    case = F.FlowCase("tmp_conc", "临时", "", [conc_step])
+    runner = F.FlowRunner(case)
+    w._flow_runner = runner
+    w._flow_action = runner.start()
+    w._run_flow_action(w._flow_action)
+    app.processEvents()
+    for _ in range(6):
+        w._send_next_concurrent()
+    check("连发 6 帧不发一问一答", len(w._channel.sent), 6)
+    check("步骤仍在执行中（还没收到否认）", runner.states[0], F.STEP_RUNNING)
+
+    # 第 6 帧被否认（109 超过最大并发数）→ 立即停发并记「最大并发数 = 6」
+    w._flow_on_frame(_up_frame(0x00, 0x02, 0x00, bytes([109])))
+    app.processEvents()
+    check("收到 109 否认 → 该步通过", runner.states[0], F.STEP_OK)
+    note = runner.notes[0] or ""
+    check_true("备注给出最大并发数 = 已发帧数", "最大并发数 = 6" in note, note)
+    check_true("备注点名错误状态字含义", "超过最大并发数" in note, note)
+    sent_after = len(w._channel.sent)
+    w._send_next_concurrent()
+    app.processEvents()
+    check("停发后不再继续发帧", len(w._channel.sent), sent_after)
+    w._flow_runner = None
+    w._flow_timer.stop()
+    w._stop_concurrent()
+
+    # ⑤ 否认码不对（如 7 表号不存在）→ 判失败并点出实际码
+    runner2 = F.FlowRunner(case)
+    w._flow_runner = runner2
+    w._flow_action = runner2.start()
+    w._run_flow_action(w._flow_action)
+    app.processEvents()
+    for _ in range(3):
+        w._send_next_concurrent()
+    w._flow_on_frame(_up_frame(0x00, 0x02, 0x00, bytes([7])))
+    app.processEvents()
+    check("否认码不是 109 → 该步失败", runner2.states[0], F.STEP_FAIL)
+    check_true("说明点出实际码与预期码",
+               ("7" in (runner2.notes[0] or "")) and ("109" in (runner2.notes[0] or "")),
+               runner2.notes[0])
+    w._flow_runner = None
+    w._flow_timer.stop()
+
+    # ⑥ 全部发完都没否认 → 判失败并写明「未测出上限」
+    small = F.FlowStep(F.KIND_SEND, "并发连发", key="F1-1", timeout=30.0,
+                       addrs=addrs[:3], batch=1, concurrent=True, expect_denial=109)
+    runner3 = F.FlowRunner(F.FlowCase("tmp_conc2", "临时", "", [small]))
+    w._flow_runner = runner3
+    w._flow_action = runner3.start()
+    w._run_flow_action(w._flow_action)
+    app.processEvents()
+    for _ in range(4):
+        w._send_next_concurrent()
+    app.processEvents()
+    check("3 帧发完仍未否认 → 判失败", runner3.states[0], F.STEP_FAIL)
+    check_true("说明写明未测出上限",
+               "未测出最大并发数" in (runner3.notes[0] or ""), runner3.notes[0])
+    w._flow_runner = None
+    w._flow_timer.stop()
+
+    # ⑦ cleanup 必须停掉并发定时器（否则关窗后仍在逐帧发帧）
+    runner4 = F.FlowRunner(F.FlowCase("tmp_conc3", "临时", "", [conc_step]))
+    w._flow_runner = runner4
+    w._flow_action = runner4.start()
+    w._run_flow_action(w._flow_action)
+    check_true("并发定时器已启动", w._flow_concurrent_timer.isActive(), "")
+    w.cleanup()
+    check("cleanup 后并发定时器已停", w._flow_concurrent_timer.isActive(), False)
+    w._flow_runner = None
+    w.cleanup()                       # 幂等
+    w.close()
+
+
+def test_sta_raw_and_observer():
+    section("[31] STA 域：向从节点发帧 + expect_sta 通过 frame_exchanged 判定")
+    from PySide6.QtWidgets import QMessageBox
+
+    app, w = _make_widget()
+    infos, warns = [], []
+    orig_info, orig_warn = QMessageBox.information, QMessageBox.warning
+    QMessageBox.information = staticmethod(lambda *a, **k: infos.append(a[2] if len(a) > 2 else ""))
+    QMessageBox.warning = staticmethod(lambda *a, **k: warns.append(a[2] if len(a) > 2 else ""))
+    try:
+        # ① 未启动从节点模拟 → 弹框 + 一个字节都不发
+        w.edit_sta_raw.setText("68 11 22 16")
+        w._send_sta_raw()
+        check("未启动模拟时给提示", len(infos), 1)
+        check("未启动模拟时不发送", len(w._channel.sent), 0)
+
+        # ② 已启动（假服务）→ 帧发给从节点串口，并进报文表
+        class _FakeSim:
+            def __init__(self):
+                self.sent = []
+
+            def isRunning(self):                     # noqa: N802 - 跟随 Qt 命名
+                return True
+
+            def send_frame(self, frame):
+                self.sent.append(bytes(frame))
+                return True
+
+            recent_responses = []
+
+        w._sta_sim = _FakeSim()
+        rows_before = w.raw_table.rowCount()
+        w.edit_sta_raw.setText("68 AA AA AA AA AA AA 68 14 0C DA 16")
+        w._send_sta_raw()
+        check("已启动时发到从节点串口", len(w._sta_sim.sent), 1)
+        check("报文表多一行", w.raw_table.rowCount(), rows_before + 1)
+
+        # ③ 非法 HEX → 弹框且不发送
+        w.edit_sta_raw.setText("68 12 0G")
+        before = len(w._sta_sim.sent)
+        w._send_sta_raw()
+        check_true("非法 HEX 弹框给出原因", warns and "HEX" in warns[-1], warns)
+        check("非法 HEX 不发送", len(w._sta_sim.sent), before)
+
+        # ④ expect_sta 步由 frame_exchanged 判定（645 读事件记录）
+        step = F.FlowStep(F.KIND_EXPECT_STA, "CCO 抄读事件记录", timeout=5.0,
+                          sta_filter={"域": "645", "控制码": 0x11, "DI": "0301"})
+        case = F.FlowCase("tmp_sta", "临时", "", [
+            step,
+            F.FlowStep(F.KIND_WAIT, "尾", afn=0x03, fn=10, timeout=1.0),
+        ])
+        runner = F.FlowRunner(case)
+        w._flow_runner = runner
+        w._flow_action = runner.start()
+        check("首步是 expect_sta", w._flow_action.kind, F.KIND_EXPECT_STA)
+        # 不匹配的帧（DI 是 0001）不改结论
+        w._on_sta_frame(C.format_hex(
+            C.parse_hex("68 33 00 00 00 00 00 68 11 04 33 33 34 33 E5 16")), [])
+        app.processEvents()
+        check("不匹配的 STA 帧不判通过", runner.states[0], F.STEP_RUNNING)
+        # 匹配的帧（控制码 11H + DI 0301xxxx → 书写序 03 01 00 00 → 线上 33 33 34 36）
+        evt = bytes.fromhex("68" + "330000000000" + "68" + "11" + "04" + "33333436" + "AA" + "16")
+        w._on_sta_frame(evt.hex(" "), [])
+        app.processEvents()
+        check("匹配的 STA 帧判通过", runner.states[0], F.STEP_OK)
+        check_true("备注写明观测到的帧", "645" in (runner.notes[0] or ""), runner.notes[0])
+        w._flow_runner = None
+        w._flow_timer.stop()
+
+        # ⑤ 未启动模拟时进入 expect_sta → 直接判失败（不能静默等到超时）
+        w._sta_sim = None
+        runner2 = F.FlowRunner(F.FlowCase("tmp_sta2", "临时", "", [step]))
+        w._flow_runner = runner2
+        w._flow_action = runner2.start()
+        w._run_flow_action(w._flow_action)
+        app.processEvents()
+        check("未启动模拟 → expect_sta 判失败", runner2.states[0], F.STEP_FAIL)
+        w._flow_runner = None
+        w._flow_timer.stop()
+    finally:
+        QMessageBox.information = orig_info
+        QMessageBox.warning = orig_warn
+    w._sta_sim = None
+    w.close()
+
+
 def main():
     test_cases()
     test_runner()
@@ -1210,6 +1711,14 @@ def main():
     test_read_payload()
     test_two_round_read()
     test_delay_correct()
+    test_tightened_cases()
+    test_new_checks()
+    test_match_sta_frame()
+    test_silence_window()
+    test_expect_denial()
+    test_alt_keys()
+    test_split_and_addrs()
+    test_sta_raw_and_observer()
 
     print()
     if FAILED:

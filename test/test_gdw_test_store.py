@@ -314,10 +314,15 @@ def test_select_all_pages():
     app.processEvents()
     total = sum(C.leaf_count(key) for key, _l in C.PAGES)
     got = {k: len(v) for k, v in w._checked.items()}
+    import gdw_test_flows as F
+
+    flow_n = len(F.all_cases())
     # 「主动上报」页 19 条全是上行命令（06H/56H 上报、00H/50H 确认否认）：
     # 由被测设备主动发出，本页不下发，因此全选不会勾上它们
-    check("六页全选（EB 75 / 读取 47 / 设置 56 / 上报 0 上行 / 自定义 0 / 流程 9）",
-          got, {"read": 47, "write": 56, "report": 0, "eb": 75, "custom": 0, "flow": 9})
+    # 流程页条数 = 内置 9 + 文档补充 7（+ 自定义，见 test_gdw_flow_custom）
+    check(f"六页全选（EB 75 / 读取 47 / 设置 56 / 上报 0 上行 / 自定义 0 / 流程 {flow_n}）",
+          got, {"read": 47, "write": 56, "report": 0, "eb": 75, "custom": 0,
+                "flow": flow_n})
     # 流程页是脚本化用例，不进命令队列，因此不计入合计
     check("合计等于各页可下发之和（流程页不计）", sum(got.values()) - got["flow"], 47 + 56 + 75)
     check_true("标签含本页与合计", "（本页）" in w.lbl_checked.text()

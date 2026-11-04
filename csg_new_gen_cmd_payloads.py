@@ -1532,13 +1532,20 @@ def _parse_cmd_test_frame(payload: bytes, direction: int, base_offset: int) -> l
        base_offset + 2, base_offset + 3)
     offset = 4
     if test_id == 0x04:
-        # 2.0测试：APP_TEST_MODE_SPLC 结构
+        # 2.0测试：APP_TEST_MODE_SPLC 结构（《宽带双模通信模块（通感一体物联版）
+        # 相关测试命令定义_260922.docx》注：test_id/pad/data_len + agreen_ver/file_len/ext_id/test_data）
         if data_len < 4:
             _f(table, "❌ 解析失败", "", "", "2.0测试数据区长度不足4字节", None, None)
             return table
         if offset + data_len > len(payload):
-            _f(table, "❌ 解析失败", "", "", "2.0测试数据区超出负载", None, None)
-            return table
+            # 现场日志常把「数据区长度」写成占位值（如 65535），此时按实际剩余字节解析，
+            # 并把不一致如实标出来 —— 直接判失败会让用户看不到任何字段。
+            _f(table, "⚠ 长度不一致", _hex(payload[2:4]), str(data_len),
+               f"数据区长度声明 {data_len} 字节，实际只剩 {len(payload) - offset} 字节，"
+               f"已按实际字节解析", base_offset + 2, base_offset + 3)
+            data_len = len(payload) - offset
+            if data_len < 4:
+                return table
         agreeon_ver = payload[offset]
         file_len = payload[offset + 1]
         ext_id = _uint16_le(payload, offset + 2)

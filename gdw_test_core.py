@@ -270,12 +270,12 @@ def eb_groups() -> List[Tuple[str, str, List[EbItem]]]:
 
 
 def flow_items() -> Tuple[FlowItem, ...]:
-    """流程测试页叶子（来自 ``gdw_test_flows.FLOW_CASES``）。"""
+    """流程测试页叶子（`gdw_test_flows.all_cases()`：内置 + 文档补充 + 用户自定义）。"""
     import gdw_test_flows as flows
 
     return tuple(
         FlowItem(c.fid, c.name, c.desc, len(c.steps), c.needs_slave, c.source)
-        for c in flows.FLOW_CASES
+        for c in flows.all_cases()
     )
 
 
@@ -493,6 +493,19 @@ def build_frame(cmd: GdwCommand, values: Mapping[str, Any], *,
         raise FrameBuildError(f"组帧失败：{type(exc).__name__}: {exc}") from exc
 
 
+#: 整数类型 → 最大值（派生长度夹紧用）
+_INT_LIMITS = {"uint8": 0xFF, "uint16": 0xFFFF, "uint32": 0xFFFFFFFF,
+               "int8": 0x7F, "int16": 0x7FFF, "int32": 0x7FFFFFFF}
+
+
+def _int_field_limit(fields: Sequence[Mapping[str, Any]], name: str) -> int:
+    """目标字段能装下的最大值（找不到按 1 字节处理）。"""
+    for fld in fields:
+        if fld.get("name") == name:
+            return _INT_LIMITS.get(str(fld.get("type")), 0xFF)
+    return 0xFF
+
+
 def _apply_derived_lengths(fields: Sequence[Mapping[str, Any]],
                            values: Dict[str, Any]) -> None:
     """按 schema 的 `count_field`/`length_field` 回填派生字段（内容长度优先）。"""
@@ -506,7 +519,9 @@ def _apply_derived_lengths(fields: Sequence[Mapping[str, Any]],
             n = len(parse_hex(str(values.get(fld.get("name")) or "")))
         except FrameBuildError:
             continue
-        values[target] = n if 0 <= n <= 0xFF else values.get(target)
+        # 按目标字段的宽度夹紧（表 135 的「报文长度」是 BIN 2 字节，按 0xFF 夹会写错）
+        limit = _int_field_limit(fields, target)
+        values[target] = n if 0 <= n <= limit else values.get(target)
     for fld in fields:
         if fld.get("type") != "list":
             continue

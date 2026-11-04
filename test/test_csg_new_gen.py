@@ -235,6 +235,28 @@ def test_test_frame_loopback():
     print("[OK] 回环测试帧测试通过")
 
 
+
+def test_test_frame_2_0_len_fallback():
+    """2.0 测试：data_len 写成占位值（超过实际字节）时按实际解析，不整段判失败
+
+    文档《宽带双模通信模块（通感一体物联版）相关测试命令定义》：
+    2.0 测试数据区 = test_id/pad/data_len + agreen_ver + file_len + ext_id + test_data。
+    现场日志常把 data_len 填 0xFFFF，旧实现直接「❌ 解析失败」，一条字段都看不到。
+    """
+    import csg_new_gen_cmd_payloads as Payloads
+
+    # test_id=0x04 + pad + data_len=0xFFFF(占位) + agreen_ver=9 + file_len=3 + ext_id=0x0007 + 数据2字节
+    payload = bytes([0x04, 0x00, 0xFF, 0xFF, 0x09, 0x03, 0x07, 0x00, 0x11, 0x22])
+    table = Payloads._parse_cmd_test_frame(payload, 0, 0)
+    rows = {str(r[0]).strip(): r for r in table}
+    assert "⚠ 长度不一致" in rows, list(rows)
+    assert "协议版本号" in rows, list(rows)
+    assert "扩展ID" in rows, list(rows)
+    assert "7" in str(rows["扩展ID"][2]), rows["扩展ID"]
+    assert "非组网场景TEI" in str(rows["扩展ID"][3]), rows["扩展ID"]
+    print("[OK] 2.0测试 长度占位兜底解析通过")
+
+
 def test_active_report_event():
     """测试事件主动上报"""
     parser = CSGNewGenParser()
@@ -742,6 +764,7 @@ def main():
     test_node_restart_downlink()
     test_node_info_query_downlink()
     test_test_frame_loopback()
+    test_test_frame_2_0_len_fallback()
     test_active_report_event()
     test_broadcast_command()
     test_management_message()

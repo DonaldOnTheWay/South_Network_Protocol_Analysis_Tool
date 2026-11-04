@@ -220,6 +220,15 @@ GUI_TESTS = [
     "test/test_gdw_test_network.py",
     # 协议7 测试页的支持判定口径（确认即支持 / 抄表必须同命令数据 / 否认错误状态字）
     "test/test_gdw_test_expect.py",
+    # 协议7 流程测试页：内置/补充/负面用例 + 引擎状态机 + 判定加严 + STA 观测 + 自定义用例 JSON + 编辑器
+    "test/test_gdw_flows.py",
+    "test/test_gdw_flow_custom.py",
+    # 协议7 档案管理「查询从节点信息」按响应总数翻页取全 + 节点 2 字节信息解析
+    "test/test_gdw_archive_query.py",
+    # 协议7 档案管理：详细版本列 LME 条目解析 + 抄读/版本查询的次数·成功率·停止·清除记录
+    "test/test_gdw_archive_test_ops.py",
+    # 协议7 档案管理：抄读数据项配置 + 645/698 内层组帧（含 STA 模块 EB03→EB55 映射）
+    "test/test_gdw_archive_copy_items.py",
     # 协议测试页的串口/蓝牙双通道控制器（就绪/文案/整帧单写/超限/双通道 RX 隔离）
     "test/test_channel_link.py",
     # 粘性入口：托盘菜单内嵌输入框 + 任务栏缩略图按钮（HICON/降级/WM_COMMAND 路由/按钮分派）

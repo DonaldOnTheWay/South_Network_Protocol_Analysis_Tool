@@ -304,15 +304,20 @@ def test_flow_run_order():
     w._set_all_checked(True)
     app.processEvents()
 
-    tree_order = [c.name for c in F.FLOW_CASES]          # 用例定义的界面顺序
+    # 用例集合 = 内置 + 文档补充 + 自定义（1.26.20 起 9 → 16），不要再写死 9
+    try:
+        all_cases = F.all_cases()
+    except AttributeError:                                # 兼容旧版只有内置用例
+        all_cases = F.FLOW_CASES
+    tree_order = [c.name for c in all_cases]              # 用例定义的界面顺序
     cases = w._flow_selected_cases()
-    check("全选后 9 条都进来了", len(cases), 9)
+    check(f"全选后 {len(all_cases)} 条都进来了", len(cases), len(all_cases))
     check("执行顺序 = 界面自上而下", [c.name for c in cases], tree_order)
 
     # 勾选记录的保存顺序也要正序（以前是 LIFO 栈导致的倒序）
     checked = w._checked.get(core.PAGE_FLOW, [])
     check("勾选记录顺序 = 用例定义顺序",
-          checked, [c.fid for c in F.FLOW_CASES])
+          checked, [c.fid for c in all_cases])
 
     # 只勾中间两条：仍按树序执行
     w._set_all_checked(False)
